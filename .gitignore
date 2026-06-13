@@ -1,3 +1,7 @@
+# build output (the launcher's binary; exec target of run.sh)
+/terva-tasks
 /bin/
+
+# per-session task state written next to the binary during dev
 tasks.json
 tasks-*.json

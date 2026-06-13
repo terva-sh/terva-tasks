@@ -9,12 +9,17 @@ panel, with a separate task list per session:
 - `task_update` — status transitions, with a one-active invariant and evidence.
 - `/tasks` — open or focus the task panel.
 
+The live list is also injected into the model's context each turn (a host context
+card), and the active task shows in the status line — so the agent stays oriented
+without re-querying.
+
 ## Requirements
 
-terva **v0.105.0+** (extension protocol v2). terva-tasks keeps a separate task
-list per session, which relies on the session identity the host delivers in
-protocol v2. It calls `RequireProtocol(2)` and refuses to load on an older host
-with a clear message rather than mis-keying state. Building needs Go 1.22+.
+terva **v0.105.1+** (protocol v2 with extension context cards). terva-tasks keeps a
+per-session task list and injects it into the model's context, so it needs both
+session identity and the context surface — both shipped in v0.105.1. It calls
+`RequireProtocol(2)` and refuses to load on an older host with a clear message
+rather than misbehaving. Building needs Go 1.22+.
 
 ## Install
 
@@ -24,20 +29,17 @@ From a clone of this repo:
 terva ext install .
 ```
 
-The manifest runs the extension from source (`go run .`), which resolves the
-terva SDK and compiles on first launch. For faster startup, build a binary and
-point the manifest at it:
-
-```bash
-go build -o terva-tasks .
-# then set extension.json: "exec": "./terva-tasks", "args": []
-```
-
-Or load it for a single session without installing:
+The manifest's launcher (`run.sh`) builds the extension on first launch
+(rebuilding only when sources change) and runs the compiled binary — so
+installing needs only a Go 1.22+ toolchain, with no platform binary committed.
+Load it for a single session without installing:
 
 ```bash
 terva --ext /path/to/terva-tasks
 ```
+
+During local development, `just install` builds and (re)installs in one step —
+and copies the binary in, since `terva ext install` skips git-ignored files.
 
 ## Usage
 
@@ -53,8 +55,11 @@ Marking a task `done` or `blocked` is encouraged to carry short `evidence`
   and reloaded when a session opens or is resumed.
 - With no active session (`--no-session`), tasks are held in memory only and are
   lost on exit.
-- The list reaches the model only through tool results (an extension can't edit
-  the system prompt) — the argument for going native if the trial proves out.
+- The current list is injected into the model's context every turn as a host
+  context card (kept out of the transcript, so auto-compaction can't drop it), and
+  the task-discipline policy rides the cached system prompt — so the model stays
+  oriented across the session and after `/clear`. A user or project can opt out via
+  `disable_context_extensions` (the tools and panel still work).
 
 ## Development
 
@@ -67,7 +72,10 @@ go mod edit -dropreplace terva.sh/terva          # back to the pinned release
 ```
 
 ```bash
-just test   # go test -race ./internal/...
-just lint   # go vet + gofmt check
-just build  # build the binary
+just test     # go test -race ./internal/...
+just lint     # go vet + gofmt check
+just build    # build ./terva-tasks
+just install  # build + (re)install into terva for dogfooding
+just try DIR  # build + launch terva with the extension (cwd = DIR)
+just ci       # lint + race tests
 ```

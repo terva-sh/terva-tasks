@@ -22,20 +22,22 @@ func RenderCompact(tasks []Task) string {
 func compactLine(t Task) string {
 	line := fmt.Sprintf("%s  %-8s %s", t.ID, t.Status, displayLabel(t))
 	if ev := strings.TrimSpace(t.Evidence); ev != "" {
-		line += " — " + ev
+		line += " — " + CleanOneLine(ev, MaxEvidenceLen)
 	} else if nt := strings.TrimSpace(t.Note); nt != "" {
-		line += " — " + nt
+		line += " — " + CleanOneLine(nt, MaxNoteLen)
 	}
 	return line
 }
 
 // displayLabel shows the present-continuous form for an active task, else the
-// imperative title.
+// imperative title. It is sanitized to a single safe line so loaded or legacy
+// data can't inject extra lines into tool output or the panel.
 func displayLabel(t Task) string {
+	label := t.Title
 	if t.Status == StatusActive && strings.TrimSpace(t.ActiveForm) != "" {
-		return t.ActiveForm
+		label = t.ActiveForm
 	}
-	return t.Title
+	return CleanOneLine(label, MaxTitleLen)
 }
 
 // PanelTitle builds the panel header. With exactly one active task it surfaces
@@ -65,8 +67,8 @@ func PanelTitle(tasks []Task, sessionTitle string) string {
 	if blocked > 0 {
 		title += fmt.Sprintf(" · %d blocked", blocked)
 	}
-	if strings.TrimSpace(sessionTitle) != "" {
-		title += " — " + sessionTitle
+	if st := CleanOneLine(sessionTitle, MaxSessionTitle); st != "" {
+		title += " — " + st
 	}
 	return title
 }
@@ -131,7 +133,7 @@ func PanelLines(tasks []Task, showDone bool) []string {
 func panelRow(t Task) string {
 	row := fmt.Sprintf("%-9s %s", string(t.Status), displayLabel(t))
 	if ev := strings.TrimSpace(t.Evidence); ev != "" {
-		row += " — " + ev
+		row += " — " + CleanOneLine(ev, MaxEvidenceLen)
 	}
 	return row
 }
@@ -139,4 +141,114 @@ func panelRow(t Task) string {
 // PanelFooter is the static key hint line.
 func PanelFooter() string {
 	return "d expand/collapse done · r refresh · esc close"
+}
+
+// Bounds for the model-facing context card. The host caps a card at 4 KiB and
+// truncates over-budget content; we stay well under that and cap the number of
+// open lines so a large list can't flood every turn's context.
+const (
+	cardMaxOpenLines = 20
+	cardMaxBytes     = 3500
+	cardReasonLen    = 120
+)
+
+// RenderCard is the compact, bounded text injected into the model's context
+// every turn as the live task list. Open tasks (blocked → active → pending) are
+// listed; done/cancelled collapse to counts; blocked tasks carry a short reason.
+// Empty list => "" (the caller clears the card).
+func RenderCard(tasks []Task) string {
+	if len(tasks) == 0 {
+		return ""
+	}
+	var open []Task
+	done, cancelled := 0, 0
+	for _, t := range tasks {
+		switch t.Status {
+		case StatusDone:
+			done++
+		case StatusCancelled:
+			cancelled++
+		default:
+			open = append(open, t)
+		}
+	}
+	sort.SliceStable(open, func(i, j int) bool {
+		return statusRank(open[i].Status) < statusRank(open[j].Status)
+	})
+
+	var b strings.Builder
+	more := 0
+	if len(open) > cardMaxOpenLines {
+		more = len(open) - cardMaxOpenLines
+		open = open[:cardMaxOpenLines]
+	}
+	for _, t := range open {
+		b.WriteString(cardRow(t))
+		b.WriteByte('\n')
+	}
+	if more > 0 {
+		fmt.Fprintf(&b, "…and %d more open\n", more)
+	}
+	if done > 0 {
+		fmt.Fprintf(&b, "done (%d)\n", done)
+	}
+	if cancelled > 0 {
+		fmt.Fprintf(&b, "cancelled (%d)\n", cancelled)
+	}
+	out := strings.TrimRight(b.String(), "\n")
+	if len(out) > cardMaxBytes {
+		out = strings.ToValidUTF8(out[:cardMaxBytes], "") + "\n…(truncated)"
+	}
+	return out
+}
+
+func cardRow(t Task) string {
+	row := fmt.Sprintf("%-8s %s", string(t.Status), displayLabel(t))
+	if t.Status == StatusBlocked {
+		if r := strings.TrimSpace(t.Evidence); r != "" {
+			row += " — " + CleanOneLine(r, cardReasonLen)
+		}
+	}
+	return row
+}
+
+// AnyOpen reports whether any task is genuine open work (pending or active),
+// used to mark the card Blocking so the host nudges "review before done". A
+// blocked task is an explicit, acknowledged park and does not count.
+func AnyOpen(tasks []Task) bool {
+	for _, t := range tasks {
+		if t.Status == StatusPending || t.Status == StatusActive {
+			return true
+		}
+	}
+	return false
+}
+
+// StatusGlance is the short TUI status-line segment (not model-facing): the
+// active task and a done/total count. Empty when there's nothing to show.
+func StatusGlance(tasks []Task) string {
+	if len(tasks) == 0 {
+		return ""
+	}
+	var active string
+	done, total := 0, 0
+	for _, t := range tasks {
+		if t.Status == StatusCancelled {
+			continue
+		}
+		total++
+		if t.Status == StatusDone {
+			done++
+		}
+		if t.Status == StatusActive && active == "" {
+			active = displayLabel(t)
+		}
+	}
+	if total == 0 {
+		return ""
+	}
+	if active != "" {
+		return fmt.Sprintf("▸ %s (%d/%d)", CleanOneLine(active, 60), done, total)
+	}
+	return fmt.Sprintf("tasks %d/%d", done, total)
 }

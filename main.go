@@ -1,11 +1,8 @@
 // Command terva-tasks is a terva extension that gives the agent a native-style
-// task list: three LLM tools (task_list / task_create / task_update) plus a
-// persistent panel. It is a terva-only, protocol-v2 extension — it requires the
-// session-identity protocol so each session keeps its own task list.
-//
-// Build note: the session wiring below uses the protocol-v2 SDK surface
-// (e.OnSession). Until that lands in the terva checkout this file won't compile;
-// the pure logic in internal/tasks builds and is fully tested today.
+// task list: three LLM tools (task_list / task_create / task_update), a live
+// context card + status segment injected into the model's context each turn, and
+// an interactive panel. It is a terva-only, protocol-v2 extension — it requires
+// session identity (per-session lists) and the host context surface.
 package main
 
 import (
@@ -19,11 +16,17 @@ import (
 )
 
 func main() {
-	e := ext.New("terva-tasks", "0.1.0")
-	// Require protocol 2: a host that can't deliver session identity (upstream
-	// zot, or a pre-v2 terva) refuses to load this extension with a clear
-	// message rather than mis-keying per-session state.
+	e := ext.New("terva-tasks", "0.2.0")
+	// Require protocol 2: a host that can't deliver session identity or the
+	// context surface (upstream zot, or a pre-v2 terva) refuses to load this
+	// extension with a clear message rather than misbehaving.
 	e.RequireProtocol(2)
+
+	// Standing task-discipline policy, folded into the cached system prompt by
+	// the host. This is the primary policy vector now; the tool descriptions
+	// keep only a minimal fallback (a user/project can opt out of context
+	// injection via disable_context_extensions, which keeps the tools working).
+	e.ContributeContext(contextPolicy)
 
 	store := tasks.NewStore("", "agent") // dataDir set on the first session event
 	a := newApp(e, store)
@@ -48,35 +51,36 @@ func main() {
 	}
 }
 
-// Tool descriptions are the only system-prompt vector an extension has, so they
-// carry the usage policy (when to use, the one-active rule, the evidence rule).
+// contextPolicy is the standing guidance the host folds into the cached system
+// prompt (ContributeContext). It is the primary policy vector; the tool
+// descriptions below carry only a minimal restatement as an opt-out fallback.
+const contextPolicy = "You have a task list (task_create / task_update / task_list); " +
+	"its current state is shown to you each turn as a Tasks context card, so consult " +
+	"it to stay oriented and to decide what remains. Use tasks for work that is " +
+	"meaningfully multi-step, long-running, risky, or interruptible (investigate → " +
+	"implement → test → document, multi-file refactors, debugging, releases); do NOT " +
+	"create tasks for a simple factual answer, a single-file edit, or one command. " +
+	"Keep exactly one task 'active' at a time — mark a task active before working it. " +
+	"Record short evidence when you complete or block a task (a passing test command, " +
+	"an edited path, a user clarification). Do NOT mark a task 'done' while its tests " +
+	"fail, the work is partial, or errors are unresolved — use 'blocked' and say why."
 
-const descList = "Return the current task list with each task's id, status, and " +
-	"title. Call this to reorient after a long sequence of tool calls, to resume " +
-	"work after an interruption, or to decide what remains before giving a final " +
-	"answer. Tasks are referenced by the id shown here."
+// The tool descriptions are deliberately terse — the policy lives in
+// contextPolicy. They keep only the essential rules so the tools remain usable
+// if a user opts out of context injection.
 
-const descCreate = "Create one or more tasks for tracking multi-step work. " +
-	"Provide a `tasks` array; each task needs an imperative `title` (e.g. 'Patch " +
-	"the parser bug') and may include `active_form` (present-continuous, e.g. " +
-	"'Patching the parser bug', shown while the task is active), an initial " +
-	"`status` (defaults to 'pending'), and a short `note`. Ids are assigned by the " +
-	"system and returned — never supply your own. Create tasks when the work is " +
-	"meaningfully multi-step, long-running, risky, interruptible, or delegated: " +
-	"investigate → implement → test → document, multi-file refactors, debugging, " +
-	"releases. Do NOT create tasks for a simple factual answer, a single-file " +
-	"edit, or one command — that is just noise."
+const descList = "Return the current task list (id, status, title). Use it to " +
+	"reorient or to decide what remains before finishing."
 
-const descUpdate = "Update a task by `id`. Primary use is status transitions: " +
-	"mark a task 'active' before you start working on it. At most one task is " +
-	"active at a time — moving a task to 'active' automatically returns any other " +
-	"active task to 'pending', and the result tells you which. Provide `evidence` " +
-	"when setting status to 'done' or 'blocked': a passing test command, an edited " +
-	"file path, a user clarification. Do NOT mark a task 'done' if its tests are " +
-	"failing, the implementation is partial, or errors are unresolved — use " +
-	"'blocked' instead and say why in `evidence`. You may also patch `title`, " +
-	"`active_form`, or `note`. Reference the task by the id returned from " +
-	"task_create or task_list."
+const descCreate = "Create one or more tasks for multi-step work. Each needs an " +
+	"imperative `title`; optional `active_form` (present-continuous), `status` " +
+	"(default 'pending'), and `note`. Ids are system-assigned — never supply your " +
+	"own. Don't create tasks for trivial one-step requests."
+
+const descUpdate = "Update a task by `id` — mainly status transitions. Mark a task " +
+	"'active' before working it; only one task is active at a time. Provide " +
+	"`evidence` when setting 'done' or 'blocked', and use 'blocked' (not 'done') if " +
+	"the work is failing or incomplete. May also patch `title`, `active_form`, `note`."
 
 func schemaList() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{}}`)

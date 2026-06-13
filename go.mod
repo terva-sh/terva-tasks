@@ -2,4 +2,4 @@ module terva-tasks
 
 go 1.22
 
-require terva.sh/terva v0.105.0
+require terva.sh/terva v0.105.1

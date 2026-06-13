@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -356,17 +357,24 @@ func TestUpdateEmptyActiveFormFallsBackToTitle(t *testing.T) {
 	}
 }
 
-func TestUpdateBlankTitleRejected(t *testing.T) {
+func TestUpdateBlankTitleIsNoOp(t *testing.T) {
 	s := newBound(t)
 	if _, err := s.Create([]CreateSpec{{Title: "A"}}); err != nil {
 		t.Fatal(err)
 	}
+	// A blank title patch (e.g. a status-only update that incidentally carries
+	// title:"") is a no-op, not an error (hardening #6).
 	blank := "   "
-	if _, _, err := s.Update(UpdatePatch{ID: "task-1", Title: &blank}); err == nil {
-		t.Error("blank title patch should be rejected")
+	active := StatusActive
+	updated, _, err := s.Update(UpdatePatch{ID: "task-1", Title: &blank, Status: &active})
+	if err != nil {
+		t.Fatalf("blank title patch should not error: %v", err)
 	}
-	if s.List()[0].Title != "A" {
-		t.Errorf("rejected title patch must not mutate, got %q", s.List()[0].Title)
+	if updated.Title != "A" {
+		t.Errorf("blank title patch must leave title unchanged, got %q", updated.Title)
+	}
+	if updated.Status != StatusActive {
+		t.Errorf("the rest of the patch should still apply, got status %q", updated.Status)
 	}
 }
 
@@ -388,5 +396,124 @@ func TestLoadResilience(t *testing.T) {
 	}
 	if created[0].ID != "task-6" {
 		t.Errorf("nextID should derive past max suffix; got %q", created[0].ID)
+	}
+}
+
+// TestSessionIDPathSafety: a hostile session id with traversal sequences must
+// not write outside the data dir (hardening #1).
+func TestSessionIDPathSafety(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, "a")
+	s.now = fixedClock()
+	if err := s.Rebind("sess/../../escape"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create([]CreateSpec{{Title: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing escaped into the tempdir's parent.
+	if m, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), "*escape*")); len(m) > 0 {
+		t.Errorf("session id escaped the data dir: %v", m)
+	}
+	// A safe (hashed) file landed inside the data dir.
+	inside, _ := filepath.Glob(filepath.Join(dir, "tasks-*.json"))
+	if len(inside) != 1 {
+		t.Fatalf("expected one hashed session file inside the data dir, got %v", inside)
+	}
+	if base := filepath.Base(inside[0]); strings.ContainsAny(base, `/\`) || strings.Contains(base, "..") {
+		t.Errorf("unsafe session file name: %q", base)
+	}
+}
+
+// TestRebindCorruptFileNoLeak: switching into a session whose file is corrupt
+// must not show the previous session's tasks (hardening #2).
+func TestRebindCorruptFileNoLeak(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, "a")
+	s.now = fixedClock()
+	if err := s.Rebind("good"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create([]CreateSpec{{Title: "good task"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tasks-bad.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	warn := s.Rebind("bad")
+	if warn == nil {
+		t.Errorf("expected a warning when the target file is corrupt")
+	}
+	if n := len(s.List()); n != 0 {
+		t.Errorf("corrupt rebind leaked prior session tasks; got %d", n)
+	}
+	if bk, _ := filepath.Glob(filepath.Join(dir, "tasks-bad.json.corrupt-*")); len(bk) == 0 {
+		t.Errorf("corrupt file should be moved aside")
+	}
+	// The new session starts clean.
+	if _, err := s.Create([]CreateSpec{{Title: "fresh"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.List(); len(got) != 1 || got[0].Title != "fresh" {
+		t.Errorf("bad session should start fresh: %+v", got)
+	}
+}
+
+// TestCreateSanitizesFields: control/newline/ANSI characters are stripped at
+// ingress (hardening #3).
+func TestCreateSanitizesFields(t *testing.T) {
+	s := newBound(t)
+	got, err := s.Create([]CreateSpec{{
+		Title: "line1\nFAKE-TASK done injected\tend",
+		Note:  "a\x1b[31mred\rb",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(got[0].Title, "\n\r\t") {
+		t.Errorf("title not sanitized: %q", got[0].Title)
+	}
+	if got[0].Title != "line1 FAKE-TASK done injected end" {
+		t.Errorf("unexpected sanitized title: %q", got[0].Title)
+	}
+	if strings.ContainsRune(got[0].Note, 0x1b) || strings.ContainsAny(got[0].Note, "\r\n") {
+		t.Errorf("note not sanitized: %q", got[0].Note)
+	}
+}
+
+// TestCreateCaps: overlong fields truncate and oversized batches are rejected
+// (hardening #4).
+func TestCreateCaps(t *testing.T) {
+	s := newBound(t)
+	long := strings.Repeat("x", MaxTitleLen+50)
+	got, err := s.Create([]CreateSpec{{Title: long}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := []rune(got[0].Title); len(r) > MaxTitleLen+1 { // +1 for the ellipsis
+		t.Errorf("title not truncated: %d runes", len(r))
+	}
+	big := make([]CreateSpec, MaxBatch+1)
+	for i := range big {
+		big[i] = CreateSpec{Title: "t"}
+	}
+	if _, err := s.Create(big); err == nil {
+		t.Errorf("a batch over %d should be rejected", MaxBatch)
+	}
+}
+
+func TestPerSessionCap(t *testing.T) {
+	s := newBound(t)
+	for k := range MaxTasksPerSession / MaxBatch {
+		batch := make([]CreateSpec, MaxBatch)
+		for i := range batch {
+			batch[i] = CreateSpec{Title: "t"}
+		}
+		if _, err := s.Create(batch); err != nil {
+			t.Fatalf("batch %d: %v", k, err)
+		}
+	}
+	if _, err := s.Create([]CreateSpec{{Title: "over"}}); err == nil {
+		t.Errorf("creating past the per-session cap should error")
 	}
 }

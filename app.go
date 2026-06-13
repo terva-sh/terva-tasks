@@ -11,7 +11,11 @@ import (
 	"terva.sh/terva/packages/agent/ext"
 )
 
-const panelID = "terva-tasks-main"
+const (
+	panelID  = "terva-tasks-main"
+	cardID   = "tasks" // model-facing context card + status segment id
+	statusID = "tasks"
+)
 
 // app wires the pure task store to the terva extension SDK: tool handlers,
 // panel rendering, and the session re-key hook.
@@ -37,7 +41,7 @@ func newApp(e *ext.Extension, store *tasks.Store) *app {
 
 func (a *app) handleList(_ json.RawMessage) ext.ToolResult {
 	text := handlers.List(a.store)
-	a.rerender()
+	a.refresh()
 	return ext.TextResult(text)
 }
 
@@ -47,7 +51,7 @@ func (a *app) handleCreate(raw json.RawMessage) ext.ToolResult {
 		return ext.TextErrorResult(text)
 	}
 	a.ensurePanel()
-	a.rerender()
+	a.refresh()
 	return ext.TextResult(text)
 }
 
@@ -56,7 +60,7 @@ func (a *app) handleUpdate(raw json.RawMessage) ext.ToolResult {
 	if isErr {
 		return ext.TextErrorResult(text)
 	}
-	a.rerender()
+	a.refresh()
 	return ext.TextResult(text)
 }
 
@@ -76,17 +80,36 @@ func (a *app) ensurePanel() {
 	a.e.OpenPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
 }
 
-func (a *app) rerender() {
+// refresh updates every surface from current state: the model-facing context
+// card (always — it's injected each turn whether or not the panel is open), the
+// TUI status segment (always), and the panel (only when open). Called after each
+// mutation and on session change.
+func (a *app) refresh() {
+	list := a.store.List()
+
+	// Model-facing context card: inject the live list, or clear it when empty.
+	if len(list) == 0 {
+		a.e.ClearContextCard(cardID)
+	} else {
+		a.e.PushContextCard(ext.Card{
+			ID:       cardID,
+			Label:    "Tasks",
+			Text:     tasks.RenderCard(list),
+			Blocking: tasks.AnyOpen(list),
+		})
+	}
+	// TUI status segment (not model-facing); empty text clears it.
+	a.e.SetStatus(statusID, tasks.StatusGlance(list))
+
+	// Panel, only when open.
 	a.mu.Lock()
 	open := a.panelOpen
 	showDone := a.showDone
 	title := a.sessionTitle
 	a.mu.Unlock()
-	if !open {
-		return
+	if open {
+		a.e.RenderPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
 	}
-	list := a.store.List()
-	a.e.RenderPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
 }
 
 // handleCommand backs the /tasks slash command: open or focus the panel.
@@ -106,9 +129,9 @@ func (a *app) handleKey(key, text string) {
 		a.mu.Lock()
 		a.showDone = !a.showDone
 		a.mu.Unlock()
-		a.rerender()
+		a.refresh()
 	case key == "rune" && strings.EqualFold(text, "r"):
-		a.rerender()
+		a.refresh()
 	}
 }
 
@@ -128,5 +151,5 @@ func (a *app) onSession(id, title string) {
 	a.mu.Lock()
 	a.sessionTitle = title
 	a.mu.Unlock()
-	a.rerender()
+	a.refresh()
 }

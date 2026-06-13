@@ -127,7 +127,9 @@ func pathFor(dataDir, sessionID string) string {
 	if sessionID == "" || dataDir == "" {
 		return ""
 	}
-	return filepath.Join(dataDir, "tasks-"+sessionID+".json")
+	// sessionFileName contains no path separators or "..", so the join can never
+	// escape dataDir even for a hostile session id.
+	return filepath.Join(dataDir, sessionFileName(sessionID))
 }
 
 // Rebind points the store at a session. It is the single keying entry point:
@@ -153,61 +155,79 @@ func (s *Store) Rebind(sessionID string) error {
 		_ = s.saveLocked() // best-effort flush of the outgoing session
 	}
 
+	newPath := pathFor(s.dataDir, sessionID)
+
+	// Load the incoming session's state into locals first; commit to the store
+	// only after a clean load. A failed or corrupt load must never leave the new
+	// session showing the previous session's tasks.
+	var newTasks []Task
+	newNextID := 1
+	var warn error
+
+	if newPath != "" {
+		sf, found, err := readStoreFile(newPath)
+		if err != nil {
+			// Corrupt file: move it aside and start this session empty rather
+			// than failing or leaking prior state.
+			s.backupCorruptLocked(newPath)
+			warn = fmt.Errorf("corrupt session file %s moved aside; started empty: %w", newPath, err)
+			found = false
+		}
+		switch {
+		case found:
+			newTasks = sf.Tasks
+			newNextID = sf.NextID
+			if newNextID < 1 {
+				newNextID = deriveNextID(newTasks)
+			}
+		case carry && len(prevTasks) > 0:
+			// First binding out of pre-session in-memory state: carry that work
+			// into the new (empty) session file.
+			newTasks = prevTasks
+			newNextID = prevNextID
+		}
+	}
+
+	// Commit atomically.
 	s.sessionID = sessionID
-	s.path = pathFor(s.dataDir, sessionID)
+	s.path = newPath
+	s.tasks = newTasks
+	s.nextID = newNextID
 
-	if sessionID == "" {
-		s.tasks = nil
-		s.nextID = 1
-		return nil
+	// Persist carried work immediately; a brand-new empty session materializes
+	// on its first mutation.
+	if s.path != "" && carry && len(s.tasks) > 0 {
+		_ = s.saveLocked()
 	}
-
-	loaded, err := s.loadLocked()
-	if err != nil {
-		return err
-	}
-	if loaded {
-		return nil // the file is the source of truth for this session
-	}
-	if carry && len(prevTasks) > 0 {
-		s.tasks = prevTasks
-		s.nextID = prevNextID
-		return s.saveLocked()
-	}
-	s.tasks = nil
-	s.nextID = 1
-	return nil
+	return warn
 }
 
-// loadLocked reads s.path into the store. Returns loaded=false (no error) when
-// the file is missing or empty.
-func (s *Store) loadLocked() (bool, error) {
-	if s.path == "" {
-		return false, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return false, err
-	}
-	b, err := os.ReadFile(s.path)
+// readStoreFile reads a session file. found is false (no error) when the file is
+// missing or empty; a malformed file returns an error so the caller can quarantine
+// it instead of trusting partial state.
+func readStoreFile(path string) (storeFile, bool, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return storeFile{}, false, nil
 		}
-		return false, err
+		return storeFile{}, false, err
 	}
 	if strings.TrimSpace(string(b)) == "" {
-		return false, nil
+		return storeFile{}, false, nil
 	}
 	var sf storeFile
 	if err := json.Unmarshal(b, &sf); err != nil {
-		return false, fmt.Errorf("parse %s: %w", s.path, err)
+		return storeFile{}, false, fmt.Errorf("parse %s: %w", path, err)
 	}
-	s.tasks = sf.Tasks
-	s.nextID = sf.NextID
-	if s.nextID < 1 {
-		s.nextID = deriveNextID(s.tasks)
-	}
-	return true, nil
+	return sf, true, nil
+}
+
+// backupCorruptLocked renames a malformed session file aside so it isn't
+// overwritten and can be inspected, leaving the path free for a fresh start.
+func (s *Store) backupCorruptLocked(path string) {
+	bak := path + ".corrupt-" + s.now().UTC().Format("20060102T150405Z")
+	_ = os.Rename(path, bak) // best-effort
 }
 
 // deriveNextID recovers a monotonic counter from existing ids when a legacy
@@ -272,38 +292,52 @@ func (s *Store) Create(specs []CreateSpec) ([]Task, error) {
 	if len(specs) == 0 {
 		return nil, fmt.Errorf("no tasks to create")
 	}
+	if len(specs) > MaxBatch {
+		return nil, fmt.Errorf("too many tasks in one batch (%d > %d max)", len(specs), MaxBatch)
+	}
+	if len(s.tasks)+len(specs) > MaxTasksPerSession {
+		return nil, fmt.Errorf("task limit reached (%d max per session)", MaxTasksPerSession)
+	}
+	// Validate + normalize every spec before mutating (no partial create).
+	type prepared struct {
+		title, activeForm, note string
+		status                  Status
+	}
+	prep := make([]prepared, len(specs))
 	for i, sp := range specs {
-		if strings.TrimSpace(sp.Title) == "" {
+		title := CleanOneLine(sp.Title, MaxTitleLen)
+		if title == "" {
 			return nil, fmt.Errorf("task %d: title is required", i+1)
 		}
 		if sp.Status != "" && !ValidStatus(sp.Status) {
 			return nil, fmt.Errorf("task %d: invalid status %q", i+1, sp.Status)
 		}
-	}
-	now := s.nowStr()
-	ids := make([]string, 0, len(specs))
-	for _, sp := range specs {
+		af := CleanOneLine(sp.ActiveForm, MaxActiveFormLen)
+		if af == "" {
+			af = title
+		}
 		st := sp.Status
 		if st == "" {
 			st = StatusPending
 		}
-		af := strings.TrimSpace(sp.ActiveForm)
-		if af == "" {
-			af = strings.TrimSpace(sp.Title)
-		}
+		prep[i] = prepared{title: title, activeForm: af, note: CleanOneLine(sp.Note, MaxNoteLen), status: st}
+	}
+	now := s.nowStr()
+	ids := make([]string, 0, len(prep))
+	for _, p := range prep {
 		t := Task{
 			ID:         fmt.Sprintf("task-%d", s.nextID),
-			Title:      strings.TrimSpace(sp.Title),
-			ActiveForm: af,
-			Status:     st,
+			Title:      p.title,
+			ActiveForm: p.activeForm,
+			Status:     p.status,
 			Owner:      s.owner,
-			Note:       strings.TrimSpace(sp.Note),
+			Note:       p.note,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
 		s.nextID++
 		s.tasks = append(s.tasks, t)
-		if st == StatusActive {
+		if p.status == StatusActive {
 			s.applyOneActiveLocked(len(s.tasks) - 1)
 		}
 		ids = append(ids, t.ID)
@@ -339,23 +373,25 @@ func (s *Store) Update(p UpdatePatch) (Task, *Task, error) {
 	}
 	t := &s.tasks[idx]
 	if p.Title != nil {
-		if strings.TrimSpace(*p.Title) == "" {
-			return Task{}, nil, fmt.Errorf("title cannot be empty")
+		// An empty/whitespace title patch is a no-op (a title can never be
+		// blank), so a status-only update that incidentally carries an empty
+		// title isn't rejected.
+		if title := CleanOneLine(*p.Title, MaxTitleLen); title != "" {
+			t.Title = title
 		}
-		t.Title = strings.TrimSpace(*p.Title)
 	}
 	if p.ActiveForm != nil {
-		af := strings.TrimSpace(*p.ActiveForm)
+		af := CleanOneLine(*p.ActiveForm, MaxActiveFormLen)
 		if af == "" {
 			af = t.Title
 		}
 		t.ActiveForm = af
 	}
 	if p.Note != nil {
-		t.Note = strings.TrimSpace(*p.Note)
+		t.Note = CleanOneLine(*p.Note, MaxNoteLen)
 	}
 	if p.Evidence != nil {
-		t.Evidence = strings.TrimSpace(*p.Evidence)
+		t.Evidence = CleanOneLine(*p.Evidence, MaxEvidenceLen)
 	}
 	if p.Status != nil {
 		t.Status = *p.Status
