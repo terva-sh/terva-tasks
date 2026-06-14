@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,38 +80,39 @@ type storeFile struct {
 
 // Store is the session-scoped task list. The zero session id ("") means "no
 // active session": the list is held in memory and never written to disk. A
-// non-empty session id keys persistence to <dataDir>/tasks-<id>.json.
+// non-empty session id keys persistence to tasks-<id>.json within the injected
+// FileStore (the host's data dir in production).
 type Store struct {
 	mu        sync.Mutex
-	dataDir   string
+	fs        FileStore // nil => in-memory only (no FileStore wired yet)
 	owner     string
 	sessionID string
-	path      string // "" => in-memory only
+	name      string // session file name; "" => in-memory only
 	now       func() time.Time
 	tasks     []Task
 	nextID    int
 }
 
-// NewStore constructs an in-memory store. dataDir may be empty at construction
-// (it often isn't known until after the host handshake); set it later with
-// SetDataDir before the first Rebind to a real session.
-func NewStore(dataDir, owner string) *Store {
+// NewStore constructs an in-memory store. fs may be nil at construction (it
+// isn't known until after the host handshake exposes Host().DataFS()); set it
+// later with SetFS before the first Rebind to a real session.
+func NewStore(fs FileStore, owner string) *Store {
 	if owner == "" {
 		owner = "agent"
 	}
 	return &Store{
-		dataDir: dataDir,
-		owner:   owner,
-		now:     time.Now,
-		nextID:  1,
+		fs:     fs,
+		owner:  owner,
+		now:    time.Now,
+		nextID: 1,
 	}
 }
 
-// SetDataDir sets the directory used for session files. Safe to call before the
-// first Rebind.
-func (s *Store) SetDataDir(dir string) {
+// SetFS sets the FileStore used for session files. Safe to call before the first
+// Rebind, and idempotent (the host's DataFS is stable across sessions).
+func (s *Store) SetFS(fs FileStore) {
 	s.mu.Lock()
-	s.dataDir = dir
+	s.fs = fs
 	s.mu.Unlock()
 }
 
@@ -123,13 +123,13 @@ func (s *Store) SessionID() string {
 	return s.sessionID
 }
 
-func pathFor(dataDir, sessionID string) string {
-	if sessionID == "" || dataDir == "" {
+func nameFor(sessionID string) string {
+	if sessionID == "" {
 		return ""
 	}
-	// sessionFileName contains no path separators or "..", so the join can never
-	// escape dataDir even for a hostile session id.
-	return filepath.Join(dataDir, sessionFileName(sessionID))
+	// sessionFileName contains no path separators or "..", so the FileStore can
+	// never escape its data dir even for a hostile session id.
+	return sessionFileName(sessionID)
 }
 
 // Rebind points the store at a session. It is the single keying entry point:
@@ -151,11 +151,11 @@ func (s *Store) Rebind(sessionID string) error {
 	prevTasks := s.tasks
 	prevNextID := s.nextID
 
-	if s.path != "" {
+	if s.canPersistLocked() {
 		_ = s.saveLocked() // best-effort flush of the outgoing session
 	}
 
-	newPath := pathFor(s.dataDir, sessionID)
+	newName := nameFor(sessionID)
 
 	// Load the incoming session's state into locals first; commit to the store
 	// only after a clean load. A failed or corrupt load must never leave the new
@@ -163,14 +163,15 @@ func (s *Store) Rebind(sessionID string) error {
 	var newTasks []Task
 	newNextID := 1
 	var warn error
+	didCarry := false
 
-	if newPath != "" {
-		sf, found, err := readStoreFile(newPath)
+	if s.fs != nil && newName != "" {
+		sf, found, err := readStoreFile(s.fs, newName)
 		if err != nil {
 			// Corrupt file: move it aside and start this session empty rather
 			// than failing or leaking prior state.
-			s.backupCorruptLocked(newPath)
-			warn = fmt.Errorf("corrupt session file %s moved aside; started empty: %w", newPath, err)
+			s.backupCorruptLocked(newName)
+			warn = fmt.Errorf("corrupt session file %s moved aside; started empty: %w", newName, err)
 			found = false
 		}
 		switch {
@@ -185,28 +186,35 @@ func (s *Store) Rebind(sessionID string) error {
 			// into the new (empty) session file.
 			newTasks = prevTasks
 			newNextID = prevNextID
+			didCarry = true
 		}
 	}
 
 	// Commit atomically.
 	s.sessionID = sessionID
-	s.path = newPath
+	s.name = newName
 	s.tasks = newTasks
 	s.nextID = newNextID
 
-	// Persist carried work immediately; a brand-new empty session materializes
-	// on its first mutation.
-	if s.path != "" && carry && len(s.tasks) > 0 {
+	// Persist only genuinely carried pre-bind work immediately. A loaded board is
+	// left where it is (migrating lazily on its first mutation via the FileStore's
+	// copy-on-write), and a brand-new empty session materializes on first write.
+	if s.canPersistLocked() && didCarry {
 		_ = s.saveLocked()
 	}
 	return warn
 }
 
-// readStoreFile reads a session file. found is false (no error) when the file is
-// missing or empty; a malformed file returns an error so the caller can quarantine
-// it instead of trusting partial state.
-func readStoreFile(path string) (storeFile, bool, error) {
-	b, err := os.ReadFile(path)
+// canPersistLocked reports whether the store is bound to a writable session
+// file (a FileStore is wired and a session is active).
+func (s *Store) canPersistLocked() bool { return s.fs != nil && s.name != "" }
+
+// readStoreFile reads a session file through the FileStore (which, for the
+// SDK's DataFS, falls through to a legacy install-dir copy). found is false (no
+// error) when the file is missing or empty; a malformed file returns an error so
+// the caller can quarantine it instead of trusting partial state.
+func readStoreFile(fs FileStore, name string) (storeFile, bool, error) {
+	b, err := fs.ReadFile(name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return storeFile{}, false, nil
@@ -218,16 +226,23 @@ func readStoreFile(path string) (storeFile, bool, error) {
 	}
 	var sf storeFile
 	if err := json.Unmarshal(b, &sf); err != nil {
-		return storeFile{}, false, fmt.Errorf("parse %s: %w", path, err)
+		return storeFile{}, false, fmt.Errorf("parse %s: %w", name, err)
 	}
 	return sf, true, nil
 }
 
 // backupCorruptLocked renames a malformed session file aside so it isn't
-// overwritten and can be inspected, leaving the path free for a fresh start.
-func (s *Store) backupCorruptLocked(path string) {
-	bak := path + ".corrupt-" + s.now().UTC().Format("20060102T150405Z")
-	_ = os.Rename(path, bak) // best-effort
+// overwritten and can be inspected, leaving the name free for a fresh start.
+// It can only move a file in the writable layer; a corrupt file that exists
+// only in the read-only install layer (a legacy board) can't be renamed, so it
+// is instead shadowed by the fresh file the next save writes to the data dir.
+func (s *Store) backupCorruptLocked(name string) {
+	p, err := s.fs.Path(name)
+	if err != nil {
+		return
+	}
+	bak := p + ".corrupt-" + s.now().UTC().Format("20060102T150405Z")
+	_ = os.Rename(p, bak) // best-effort
 }
 
 // deriveNextID recovers a monotonic counter from existing ids when a legacy
@@ -245,17 +260,16 @@ func deriveNextID(tasks []Task) int {
 }
 
 func (s *Store) saveLocked() error {
-	if s.path == "" {
+	if !s.canPersistLocked() {
 		return nil // in-memory only
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
 	}
 	b, err := json.MarshalIndent(storeFile{Tasks: s.tasks, NextID: s.nextID}, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, b, 0o644)
+	// DataFS.WriteFile creates parent dirs and always writes to the writable
+	// layer (copy-on-write), which is what migrates a legacy board forward.
+	return s.fs.WriteFile(s.name, b, 0o644)
 }
 
 func (s *Store) nowStr() string { return s.now().UTC().Format(time.RFC3339) }

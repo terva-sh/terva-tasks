@@ -10,7 +10,7 @@ import (
 
 func boundStore(t *testing.T) *tasks.Store {
 	t.Helper()
-	s := tasks.NewStore(t.TempDir(), "test-agent")
+	s := tasks.NewStore(tasks.NewDirFS(t.TempDir()), "test-agent")
 	if err := s.Rebind("sess-1"); err != nil {
 		t.Fatalf("rebind: %v", err)
 	}

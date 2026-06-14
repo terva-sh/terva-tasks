@@ -144,7 +144,11 @@ func (a *app) handleClose() {
 // onSession re-keys persistence when the active session opens or changes
 // (resume / fork / /new). id == "" means no active session (in-memory only).
 func (a *app) onSession(id, title string) {
-	a.store.SetDataDir(a.e.Host().DataDir)
+	// DataFS layers the writable DataDir over the read-only install dir, so
+	// boards written under the old (pre-split) DataDir keep loading and migrate
+	// forward on their next save. It's stable across sessions; setting it on
+	// each session event is idempotent.
+	a.store.SetFS(a.e.Host().DataFS())
 	if err := a.store.Rebind(id); err != nil {
 		a.e.Logf("rebind session %q: %v", id, err)
 	}

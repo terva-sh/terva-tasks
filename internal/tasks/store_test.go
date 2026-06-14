@@ -18,7 +18,7 @@ func fixedClock() func() time.Time {
 // clock for deterministic timestamps.
 func newBound(t *testing.T) *Store {
 	t.Helper()
-	s := NewStore(t.TempDir(), "test-agent")
+	s := NewStore(NewDirFS(t.TempDir()), "test-agent")
 	s.now = fixedClock()
 	if err := s.Rebind("sess-1"); err != nil {
 		t.Fatalf("rebind: %v", err)
@@ -173,7 +173,7 @@ func TestStatusValidation(t *testing.T) {
 
 func TestEvidenceRoundTripAndReload(t *testing.T) {
 	dir := t.TempDir()
-	s1 := NewStore(dir, "test-agent")
+	s1 := NewStore(NewDirFS(dir), "test-agent")
 	s1.now = fixedClock()
 	if err := s1.Rebind("sess-x"); err != nil {
 		t.Fatal(err)
@@ -188,7 +188,7 @@ func TestEvidenceRoundTripAndReload(t *testing.T) {
 	}
 
 	// Reload via a fresh store over the same dir + session.
-	s2 := NewStore(dir, "test-agent")
+	s2 := NewStore(NewDirFS(dir), "test-agent")
 	s2.now = fixedClock()
 	if err := s2.Rebind("sess-x"); err != nil {
 		t.Fatal(err)
@@ -212,7 +212,7 @@ func TestEvidenceRoundTripAndReload(t *testing.T) {
 
 func TestTimestamps(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	cur := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	s.now = func() time.Time { return cur }
 	if err := s.Rebind("s"); err != nil {
@@ -245,7 +245,7 @@ func TestTimestamps(t *testing.T) {
 
 func TestRebindSwitchAndNoSession(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	s.now = fixedClock()
 	if err := s.Rebind("sess-A"); err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestRebindSwitchAndNoSession(t *testing.T) {
 
 func TestRebindCarriesPreBindWork(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	s.now = fixedClock()
 	// Create while still in-memory (ordering guarantee violated / pre-session).
 	if _, err := s.Create([]CreateSpec{{Title: "early"}}); err != nil {
@@ -385,7 +385,7 @@ func TestLoadResilience(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "tasks-legacy.json"), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	s.now = fixedClock()
 	if err := s.Rebind("legacy"); err != nil {
 		t.Fatal(err)
@@ -403,7 +403,7 @@ func TestLoadResilience(t *testing.T) {
 // not write outside the data dir (hardening #1).
 func TestSessionIDPathSafety(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	s.now = fixedClock()
 	if err := s.Rebind("sess/../../escape"); err != nil {
 		t.Fatal(err)
@@ -429,7 +429,7 @@ func TestSessionIDPathSafety(t *testing.T) {
 // must not show the previous session's tasks (hardening #2).
 func TestRebindCorruptFileNoLeak(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir, "a")
+	s := NewStore(NewDirFS(dir), "a")
 	s.now = fixedClock()
 	if err := s.Rebind("good"); err != nil {
 		t.Fatal(err)

@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	e := ext.New("terva-tasks", "0.2.0")
+	e := ext.New("terva-tasks", "0.2.1")
 	// Require protocol 2: a host that can't deliver session identity or the
 	// context surface (upstream zot, or a pre-v2 terva) refuses to load this
 	// extension with a clear message rather than misbehaving.
@@ -28,7 +28,7 @@ func main() {
 	// injection via disable_context_extensions, which keeps the tools working).
 	e.ContributeContext(contextPolicy)
 
-	store := tasks.NewStore("", "agent") // dataDir set on the first session event
+	store := tasks.NewStore(nil, "agent") // FileStore set on the first session event
 	a := newApp(e, store)
 
 	e.Command("tasks", "open the terva-tasks panel", a.handleCommand)
