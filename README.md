@@ -23,16 +23,15 @@ rather than misbehaving. Building needs Go 1.22+.
 
 ## Install
 
-From a clone of this repo:
-
 ```bash
-terva ext install .
+terva ext install https://github.com/terva-sh/terva-tasks.git
 ```
 
-The manifest's launcher (`run.sh`) builds the extension on first launch
-(rebuilding only when sources change) and runs the compiled binary — so
-installing needs only a Go 1.22+ toolchain, with no platform binary committed.
-Load it for a single session without installing:
+terva clones the repo and the `run.sh` launcher builds it on first launch
+(rebuilding only when sources change) — so installing needs only a Go 1.22+
+toolchain, with no platform binary committed. You can also install from a local
+clone (`terva ext install .`), or load it for a single session without
+installing:
 
 ```bash
 terva --ext /path/to/terva-tasks
