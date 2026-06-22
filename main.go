@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	e := ext.New("tasks", "0.2.3")
+	e := ext.New("tasks", "0.2.4")
 	// Require protocol 2: a host that can't deliver session identity or the
 	// context surface (upstream zot, or a pre-v2 terva) refuses to load this
 	// extension with a clear message rather than misbehaving.
@@ -33,9 +33,13 @@ func main() {
 
 	e.Command("tasks", "open the tasks panel", a.handleCommand)
 
-	e.Tool("task_list", descList, schemaList(), a.handleList)
-	e.Tool("task_create", descCreate, schemaCreate(), a.handleCreate)
-	e.Tool("task_update", descUpdate, schemaUpdate(), a.handleUpdate)
+	// Effect-class each tool so the host can auto-admit them without prompting:
+	// task_list only inspects (ReadOnly), and create/update read+write nothing but
+	// this extension's own data dir (local-data). Without these, a read-only or
+	// workspace approval mode would gate the task tools on every call.
+	e.Tool("task_list", descList, schemaList(), a.handleList, ext.ReadOnly())
+	e.Tool("task_create", descCreate, schemaCreate(), a.handleCreate, ext.WithAuthority(ext.AuthorityLocalData))
+	e.Tool("task_update", descUpdate, schemaUpdate(), a.handleUpdate, ext.WithAuthority(ext.AuthorityLocalData))
 
 	e.OnPanelKey(panelID, a.handleKey, a.handleClose)
 
