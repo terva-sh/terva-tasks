@@ -1,6 +1,6 @@
 {
-  "name": "terva-tasks",
-  "version": "0.2.1",
+  "name": "tasks",
+  "version": "0.2.3",
   "exec": "./run.sh",
   "language": "go",
   "description": "native-style task list for multi-step work",

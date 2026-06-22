@@ -224,6 +224,31 @@ func AnyOpen(tasks []Task) bool {
 	return false
 }
 
+// openSummaryMaxNames bounds how many open-task labels the closing-the-list
+// warning lists inline, so a large board can't flood a single result line.
+const openSummaryMaxNames = 5
+
+// OpenSummary classifies a list for the closing-the-list warning
+// (handlers.Update). It returns the count of genuinely open tasks (pending or
+// active, matching AnyOpen), how many of those are active, and a short bounded
+// slice of "id status" labels for the warning text. Blocked tasks are
+// acknowledged parks and are excluded, consistent with AnyOpen.
+func OpenSummary(tasks []Task) (open, active int, names []string) {
+	for _, t := range tasks {
+		if t.Status != StatusPending && t.Status != StatusActive {
+			continue
+		}
+		open++
+		if t.Status == StatusActive {
+			active++
+		}
+		if len(names) < openSummaryMaxNames {
+			names = append(names, t.ID+" "+string(t.Status))
+		}
+	}
+	return open, active, names
+}
+
 // StatusGlance is the short TUI status-line segment (not model-facing): the
 // active task and a done/total count. Empty when there's nothing to show.
 func StatusGlance(tasks []Task) string {

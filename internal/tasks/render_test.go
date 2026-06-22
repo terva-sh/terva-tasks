@@ -137,6 +137,38 @@ func TestAnyOpen(t *testing.T) {
 	}
 }
 
+func TestOpenSummary(t *testing.T) {
+	// pending + active count as open (blocked/done/cancelled don't); active is
+	// tallied separately and names carry "id status".
+	tasks := []Task{
+		{ID: "task-1", Status: StatusActive},
+		{ID: "task-2", Status: StatusPending},
+		{ID: "task-3", Status: StatusBlocked},
+		{ID: "task-4", Status: StatusDone},
+		{ID: "task-5", Status: StatusCancelled},
+	}
+	open, active, names := OpenSummary(tasks)
+	if open != 2 || active != 1 {
+		t.Fatalf("want open=2 active=1, got open=%d active=%d", open, active)
+	}
+	if len(names) != 2 || names[0] != "task-1 active" || names[1] != "task-2 pending" {
+		t.Errorf("unexpected names: %v", names)
+	}
+
+	// names are bounded; count still reflects the full total.
+	var many []Task
+	for range openSummaryMaxNames + 3 {
+		many = append(many, Task{ID: "task-x", Status: StatusPending})
+	}
+	open, _, names = OpenSummary(many)
+	if open != openSummaryMaxNames+3 {
+		t.Errorf("count should be full total, got %d", open)
+	}
+	if len(names) != openSummaryMaxNames {
+		t.Errorf("names should cap at %d, got %d", openSummaryMaxNames, len(names))
+	}
+}
+
 func TestStatusGlance(t *testing.T) {
 	if StatusGlance(nil) != "" {
 		t.Error("empty list => empty glance")

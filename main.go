@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	e := ext.New("terva-tasks", "0.2.1")
+	e := ext.New("tasks", "0.2.3")
 	// Require protocol 2: a host that can't deliver session identity or the
 	// context surface (upstream zot, or a pre-v2 terva) refuses to load this
 	// extension with a clear message rather than misbehaving.
@@ -31,7 +31,7 @@ func main() {
 	store := tasks.NewStore(nil, "agent") // FileStore set on the first session event
 	a := newApp(e, store)
 
-	e.Command("tasks", "open the terva-tasks panel", a.handleCommand)
+	e.Command("tasks", "open the tasks panel", a.handleCommand)
 
 	e.Tool("task_list", descList, schemaList(), a.handleList)
 	e.Tool("task_create", descCreate, schemaCreate(), a.handleCreate)
@@ -54,16 +54,31 @@ func main() {
 // contextPolicy is the standing guidance the host folds into the cached system
 // prompt (ContributeContext). It is the primary policy vector; the tool
 // descriptions below carry only a minimal restatement as an opt-out fallback.
-const contextPolicy = "You have a task list (task_create / task_update / task_list); " +
-	"its current state is shown to you each turn as a Tasks context card, so consult " +
-	"it to stay oriented and to decide what remains. Use tasks for work that is " +
-	"meaningfully multi-step, long-running, risky, or interruptible (investigate → " +
-	"implement → test → document, multi-file refactors, debugging, releases); do NOT " +
-	"create tasks for a simple factual answer, a single-file edit, or one command. " +
-	"Keep exactly one task 'active' at a time — mark a task active before working it. " +
-	"Record short evidence when you complete or block a task (a passing test command, " +
-	"an edited path, a user clarification). Do NOT mark a task 'done' while its tests " +
-	"fail, the work is partial, or errors are unresolved — use 'blocked' and say why."
+const contextPolicy = "You have a task list (task_create / task_update / task_list). " +
+	"Its current state is shown to you each turn as a Tasks context card — consult it " +
+	"to stay oriented and to decide what remains.\n" +
+	"\n" +
+	"WHEN: Use tasks for work that is meaningfully multi-step, long-running, risky, or " +
+	"interruptible. Skip them for a simple factual answer, a single-file edit, or one " +
+	"command.\n" +
+	"\n" +
+	"PLAN UP FRONT (before you start editing):\n" +
+	"- Break the work into its distinct steps and create ONE task per step — in a single " +
+	"task_create call, as separate array items. Investigate / implement / test / document " +
+	"is four tasks, not one.\n" +
+	"- Never create a single umbrella task (\"develop\", \"implement the feature\", \"do " +
+	"the work\") and run everything under it. If a title doesn't name a specific, checkable " +
+	"outcome, split it.\n" +
+	"- Title each task as a specific outcome. GOOD: [\"Add CSV serializer\", \"Wire export " +
+	"button to serializer\", \"Add export integration test\", \"Document the export flag\"]. " +
+	"BAD: [\"Develop the export feature\"].\n" +
+	"\n" +
+	"WHILE WORKING:\n" +
+	"- Keep exactly one task 'active' at a time — mark a task active before working it.\n" +
+	"- Record short evidence when you complete or block a task (a passing test command, " +
+	"an edited path, a user clarification).\n" +
+	"- Do NOT mark a task 'done' while its tests fail, the work is partial, or errors are " +
+	"unresolved — use 'blocked' and say why."
 
 // The tool descriptions are deliberately terse — the policy lives in
 // contextPolicy. They keep only the essential rules so the tools remain usable
@@ -72,10 +87,12 @@ const contextPolicy = "You have a task list (task_create / task_update / task_li
 const descList = "Return the current task list (id, status, title). Use it to " +
 	"reorient or to decide what remains before finishing."
 
-const descCreate = "Create one or more tasks for multi-step work. Each needs an " +
-	"imperative `title`; optional `active_form` (present-continuous), `status` " +
-	"(default 'pending'), and `note`. Ids are system-assigned — never supply your " +
-	"own. Don't create tasks for trivial one-step requests."
+const descCreate = "Create tasks for multi-step work. Decompose the job and pass each " +
+	"step as a separate array item in one call — one task per step, not a single " +
+	"'develop' / 'implement everything' task. Each needs an imperative `title` naming a " +
+	"specific, checkable outcome; optional `active_form` (present-continuous), `status` " +
+	"(default 'pending'), and `note`. Ids are system-assigned — never supply your own. " +
+	"Don't create tasks for trivial one-step requests."
 
 const descUpdate = "Update a task by `id` — mainly status transitions. Mark a task " +
 	"'active' before working it; only one task is active at a time. Provide " +

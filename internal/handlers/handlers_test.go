@@ -102,18 +102,90 @@ func TestUpdateEvidenceNudge(t *testing.T) {
 	s := boundStore(t)
 	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
 
-	// done without evidence -> nudge.
-	text, _ := Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
-	if !strings.Contains(text, "evidence is recommended") {
-		t.Errorf("expected evidence nudge:\n%s", text)
+	// done without evidence -> sharpened nudge naming the task and the status.
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	if isErr {
+		t.Fatalf("nudge must stay soft (no error): %s", text)
+	}
+	if !strings.Contains(text, "task-1 marked done without evidence") {
+		t.Errorf("expected sharpened evidence nudge naming the task:\n%s", text)
 	}
 	// done with evidence -> no nudge, evidence shown inline.
 	text, _ = Update(s, json.RawMessage(`{"id":"task-2","status":"done","evidence":"go test ./... passed"}`))
-	if strings.Contains(text, "evidence is recommended") {
+	if strings.Contains(text, "without evidence") {
 		t.Errorf("unexpected nudge when evidence given:\n%s", text)
 	}
 	if !strings.Contains(text, "go test ./... passed") {
 		t.Errorf("evidence not shown inline:\n%s", text)
+	}
+}
+
+// Closing-the-list warning (Invariant A2): marking a task done/cancelled while
+// real work remains and nothing is active is surfaced as a soft note, never an
+// error, and never on a genuinely complete list or mid-work completion.
+func TestUpdateClosingListWarning(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	if isErr {
+		t.Fatalf("warning must stay soft (no error): %s", text)
+	}
+	if !strings.Contains(text, "still open") || !strings.Contains(text, "task-2 pending") {
+		t.Errorf("expected closing-list warning naming task-2:\n%s", text)
+	}
+	if !strings.Contains(text, "none active") {
+		t.Errorf("warning should note nothing is active:\n%s", text)
+	}
+}
+
+func TestUpdateClosingWarningOnCancelled(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	text, _ := Update(s, json.RawMessage(`{"id":"task-1","status":"cancelled"}`))
+	if !strings.Contains(text, "still open") {
+		t.Errorf("cancelling the active task with open work should warn:\n%s", text)
+	}
+}
+
+func TestUpdateNoWarningWhenListComplete(t *testing.T) {
+	// Marking the last open task done => no warning (criterion 3: don't nag on a
+	// genuinely complete list).
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	if isErr {
+		t.Fatalf("unexpected error: %s", text)
+	}
+	if strings.Contains(text, "still open") {
+		t.Errorf("complete list must not warn:\n%s", text)
+	}
+}
+
+func TestUpdateNoWarningWhenAnotherActive(t *testing.T) {
+	// Closing a sibling while a different task is still active is normal mid-work
+	// completion (focus is elsewhere) => no warning.
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	text, _ := Update(s, json.RawMessage(`{"id":"task-2","status":"done"}`))
+	if strings.Contains(text, "still open") {
+		t.Errorf("a task still active means work is mid-flight; no warning:\n%s", text)
+	}
+}
+
+func TestUpdateNoWarningOnReopen(t *testing.T) {
+	// A reopen (done -> pending) keys off a non-terminal target status and must
+	// not trigger the closing warning even though open work then exists.
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	text, _ := Update(s, json.RawMessage(`{"id":"task-1","status":"pending"}`))
+	if strings.Contains(text, "still open") {
+		t.Errorf("reopen must not warn:\n%s", text)
 	}
 }
 

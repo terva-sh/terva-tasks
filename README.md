@@ -53,7 +53,7 @@ Marking a task `done` or `blocked` is encouraged to carry short `evidence`
 - Tasks persist to `tasks-<session-id>.json` in the host's per-extension data
   dir, saved on every change and reloaded when a session opens or is resumed.
   On terva **v0.105.2+** that data dir is a dedicated writable location separate
-  from the install dir (`$TERVA_HOME/ext-data/terva-tasks/`); boards written by
+  from the install dir (`$TERVA_HOME/ext-data/tasks/`); boards written by
   an earlier version under the old in-install location are read through and
   migrate forward automatically on their next save, so upgrading loses nothing.
 - With no active session (`--no-session`), tasks are held in memory only and are

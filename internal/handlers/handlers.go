@@ -97,10 +97,30 @@ func Update(s *tasks.Store, raw json.RawMessage) (string, bool) {
 	if deactivated != nil {
 		fmt.Fprintf(&b, "Deactivated %s (was active): %s\n", deactivated.ID, deactivated.Title)
 	}
+	// Soft evidence nudge: name the task and the status so the recommendation is
+	// actionable, not generic. Stays a note (never isError) — evidence is
+	// encouraged, not mechanically required.
 	if (updated.Status == tasks.StatusDone || updated.Status == tasks.StatusBlocked) && strings.TrimSpace(updated.Evidence) == "" {
-		b.WriteString("note: evidence is recommended when marking a task done or blocked\n")
+		fmt.Fprintf(&b, "note: %s marked %s without evidence — add a passing test command, an edited path, or a short reason so %q is checkable.\n",
+			updated.ID, updated.Status, string(updated.Status))
+	}
+	// List once: reused for the closing-the-list warning and the inline render.
+	list := s.List()
+	// Soft closing-the-list warning: marking a task done/cancelled when real work
+	// (pending/active) remains and nothing is currently active means the agent
+	// closed its focus and left work behind. Observational — the transition still
+	// applied. Blocked tasks are acknowledged parks (excluded by OpenSummary).
+	if updated.Status == tasks.StatusDone || updated.Status == tasks.StatusCancelled {
+		if open, active, names := tasks.OpenSummary(list); open > 0 && active == 0 {
+			label := strings.Join(names, ", ")
+			if open > len(names) {
+				label += fmt.Sprintf(", +%d more", open-len(names))
+			}
+			fmt.Fprintf(&b, "note: %s %s, but %d task(s) still open (%s) and none active — mark the next one active or finish them before wrapping up.\n",
+				updated.ID, updated.Status, open, label)
+		}
 	}
 	b.WriteString("\n")
-	b.WriteString(tasks.RenderCompact(s.List()))
+	b.WriteString(tasks.RenderCompact(list))
 	return b.String(), false
 }
