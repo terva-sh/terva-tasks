@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -39,8 +40,22 @@ func newApp(e *ext.Extension, store *tasks.Store) *app {
 // unit-tested). These methods add the panel side effects and wrap the text in
 // an ext.ToolResult.
 
-func (a *app) handleList(_ json.RawMessage) ext.ToolResult {
-	text := handlers.List(a.store)
+func (a *app) handleList(raw json.RawMessage) ext.ToolResult {
+	text, isErr := handlers.List(a.store, raw)
+	if isErr {
+		return ext.TextErrorResult(text)
+	}
+	a.refresh()
+	return ext.TextResult(text)
+}
+
+func (a *app) handleArchive(raw json.RawMessage) ext.ToolResult {
+	text, isErr := handlers.Archive(a.store, raw)
+	if isErr {
+		return ext.TextErrorResult(text)
+	}
+	// Archive isn't a work-starting action, so it doesn't force the panel open;
+	// refresh updates it (and the card/status) if it's already open.
 	a.refresh()
 	return ext.TextResult(text)
 }
@@ -66,6 +81,17 @@ func (a *app) handleUpdate(raw json.RawMessage) ext.ToolResult {
 
 // ---- panel ----
 
+// panelBody renders the panel lines for the current list and appends a one-line
+// hint when archived generations exist, so the user can discover them (via
+// task_list archived) without the model-facing card carrying that weight.
+func (a *app) panelBody(list []tasks.Task, showDone bool) []string {
+	lines := tasks.PanelLines(list, showDone)
+	if n := len(a.store.Generations()); n > 0 {
+		lines = append(lines, fmt.Sprintf("  %d archived — task_list archived to view", n))
+	}
+	return lines
+}
+
 func (a *app) ensurePanel() {
 	a.mu.Lock()
 	already := a.panelOpen
@@ -77,7 +103,7 @@ func (a *app) ensurePanel() {
 		return
 	}
 	list := a.store.List()
-	a.e.OpenPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
+	a.e.OpenPanel(panelID, tasks.PanelTitle(list, title), a.panelBody(list, showDone), tasks.PanelFooter())
 }
 
 // refresh updates every surface from current state: the model-facing context
@@ -108,7 +134,7 @@ func (a *app) refresh() {
 	title := a.sessionTitle
 	a.mu.Unlock()
 	if open {
-		a.e.RenderPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
+		a.e.RenderPanel(panelID, tasks.PanelTitle(list, title), a.panelBody(list, showDone), tasks.PanelFooter())
 	}
 }
 
@@ -120,7 +146,7 @@ func (a *app) handleCommand(_ string) ext.Response {
 	title := a.sessionTitle
 	a.mu.Unlock()
 	list := a.store.List()
-	return ext.OpenPanel(panelID, tasks.PanelTitle(list, title), tasks.PanelLines(list, showDone), tasks.PanelFooter())
+	return ext.OpenPanel(panelID, tasks.PanelTitle(list, title), a.panelBody(list, showDone), tasks.PanelFooter())
 }
 
 func (a *app) handleKey(key, text string) {

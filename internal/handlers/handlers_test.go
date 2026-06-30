@@ -211,13 +211,313 @@ func TestUpdateAbsentVsEmpty(t *testing.T) {
 	}
 }
 
+func TestUpdateActivateNext(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"},{"title":"C"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+
+	// Close task-1 and focus task-2 in one step.
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done","evidence":"shipped","activate_next":"task-2"}`))
+	if isErr {
+		t.Fatalf("activate_next should not error: %s", text)
+	}
+	if !strings.Contains(text, "Updated task-1 → done") || !strings.Contains(text, "Activated task-2 (next)") {
+		t.Errorf("should report both the completion and the next activation:\n%s", text)
+	}
+	// Because task-2 is now active, the closing-list warning must NOT fire.
+	if strings.Contains(text, "still open") {
+		t.Errorf("activate_next fills the focus gap; no closing-list warning expected:\n%s", text)
+	}
+	got := s.List()
+	if got[0].Status != tasks.StatusDone || got[1].Status != tasks.StatusActive {
+		t.Errorf("task-1 should be done and task-2 active: %+v", got)
+	}
+}
+
+func TestActivateNextDemotesOtherActive(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"},{"title":"C"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-3","status":"active"}`)) // C is active
+
+	// Complete A (not the active one) and focus B: the one-active invariant must
+	// demote C, and the result should report it.
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done","activate_next":"task-2"}`))
+	if isErr {
+		t.Fatalf("unexpected error: %s", text)
+	}
+	if !strings.Contains(text, "Activated task-2 (next)") || !strings.Contains(text, "Deactivated task-3 (was active)") {
+		t.Errorf("activating the next task should demote the previously active one:\n%s", text)
+	}
+	got := s.List()
+	if got[1].Status != tasks.StatusActive || got[2].Status != tasks.StatusPending {
+		t.Errorf("task-2 should be active, task-3 demoted to pending: %+v", got)
+	}
+}
+
+func TestActivateNextOnBlockedAndCancelled(t *testing.T) {
+	// blocked: park this task (stuck) and pivot to the next.
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"blocked","evidence":"waiting on API key","activate_next":"task-2"}`))
+	if isErr {
+		t.Fatalf("activate_next on blocked should be allowed: %s", text)
+	}
+	if !strings.Contains(text, "Updated task-1 → blocked") || !strings.Contains(text, "Activated task-2 (next)") {
+		t.Errorf("blocked + activate_next should park and pivot:\n%s", text)
+	}
+	if got := s.List(); got[0].Status != tasks.StatusBlocked || got[1].Status != tasks.StatusActive {
+		t.Errorf("task-1 blocked, task-2 active expected: %+v", got)
+	}
+
+	// cancelled: abandon this task and pick up the next.
+	s2 := boundStore(t)
+	Create(s2, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	text, isErr = Update(s2, json.RawMessage(`{"id":"task-1","status":"cancelled","activate_next":"task-2"}`))
+	if isErr {
+		t.Fatalf("activate_next on cancelled should be allowed: %s", text)
+	}
+	if got := s2.List(); got[0].Status != tasks.StatusCancelled || got[1].Status != tasks.StatusActive {
+		t.Errorf("task-1 cancelled, task-2 active expected: %+v", got)
+	}
+}
+
+func TestActivateNextRejectsNonSteppingStatus(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	// Pending, active, and a status-less patch can't carry activate_next, and
+	// nothing mutates.
+	for _, raw := range []string{
+		`{"id":"task-1","status":"pending","activate_next":"task-2"}`,
+		`{"id":"task-1","status":"active","activate_next":"task-2"}`,
+		`{"id":"task-1","activate_next":"task-2"}`,
+	} {
+		text, isErr := Update(s, json.RawMessage(raw))
+		if !isErr || !strings.Contains(text, "step away from this task") {
+			t.Errorf("activate_next should be rejected for %s: %s", raw, text)
+		}
+	}
+	if got := s.List(); got[0].Status != tasks.StatusPending || got[1].Status != tasks.StatusPending {
+		t.Errorf("rejected activate_next must not mutate: %+v", got)
+	}
+}
+
+func TestActivateNextUnknownTargetDoesNotMutate(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done","activate_next":"task-9"}`))
+	if !isErr || !strings.Contains(text, `no task with id "task-9"`) {
+		t.Fatalf("unknown activate_next target should error: %s", text)
+	}
+	// Pre-validated before mutation: task-1 must NOT have been marked done.
+	if got := s.List(); got[0].Status != tasks.StatusPending {
+		t.Errorf("bad activate_next must not half-apply the done; task-1 is %q", got[0].Status)
+	}
+}
+
+func TestActivateNextSameIDRejected(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
+	if text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done","activate_next":"task-1"}`)); !isErr ||
+		!strings.Contains(text, "different task") {
+		t.Errorf("activate_next naming the same task should error: %s", text)
+	}
+}
+
+func TestActivateNextEmptyIsIgnored(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	// activate_next:"" is padding — treated as absent, so this is a plain done
+	// that leaves task-2 open with nothing active: the warning (with the tip) fires.
+	text, isErr := Update(s, json.RawMessage(`{"id":"task-1","status":"done","activate_next":""}`))
+	if isErr {
+		t.Fatalf("empty activate_next must not error: %s", text)
+	}
+	if !strings.Contains(text, "still open") || !strings.Contains(text, "activate_next") {
+		t.Errorf("plain done leaving open work should warn and recommend activate_next:\n%s", text)
+	}
+}
+
+func TestClosingWarningRecommendsActivateNext(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"active"}`))
+	// Cancel leaving open work: warns AND recommends activate_next (now valid for
+	// cancelled, not just done).
+	text, _ := Update(s, json.RawMessage(`{"id":"task-1","status":"cancelled"}`))
+	if !strings.Contains(text, "still open") || !strings.Contains(text, "activate_next") {
+		t.Errorf("cancel with open work should warn and recommend activate_next:\n%s", text)
+	}
+}
+
 func TestListEmptyAndPopulated(t *testing.T) {
 	s := boundStore(t)
-	if got := List(s); got != "No tasks." {
+	if got, _ := List(s, nil); got != "No tasks." {
 		t.Errorf("empty list: %q", got)
 	}
 	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
-	if got := List(s); !strings.Contains(got, "task-1  pending  A") {
+	if got, _ := List(s, nil); !strings.Contains(got, "task-1  pending  A") {
 		t.Errorf("populated list: %q", got)
+	}
+}
+
+func TestArchiveDefaultEmptiesAndWarns(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"done","evidence":"shipped"}`))
+	// task-2 stays pending: archiving the whole board parks it.
+
+	text, isErr := Archive(s, json.RawMessage(`{"label":"phase one"}`))
+	if isErr {
+		t.Fatalf("archive should not error: %s", text)
+	}
+	if !strings.Contains(text, "Archived generation 1 (phase one)") {
+		t.Errorf("missing archive header:\n%s", text)
+	}
+	if !strings.Contains(text, "current list is now empty") {
+		t.Errorf("default archive should empty the list:\n%s", text)
+	}
+	if !strings.Contains(text, "parked 1 unfinished task(s)") || !strings.Contains(text, "task-2 pending") {
+		t.Errorf("should warn about the parked open task naming it:\n%s", text)
+	}
+	if got, _ := List(s, nil); got != "No tasks." {
+		t.Errorf("current list should be empty after archive: %q", got)
+	}
+}
+
+func TestArchiveKeepOpenRetainsOpen(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"B"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+
+	text, isErr := Archive(s, json.RawMessage(`{"keep_open":true}`))
+	if isErr {
+		t.Fatalf("archive keep_open should not error: %s", text)
+	}
+	if !strings.Contains(text, "Open tasks were kept") {
+		t.Errorf("keep_open should keep open tasks:\n%s", text)
+	}
+	if strings.Contains(text, "parked") {
+		t.Errorf("keep_open must not warn about parked work:\n%s", text)
+	}
+	got, _ := List(s, nil)
+	if !strings.Contains(got, "task-2  pending  B") || strings.Contains(got, "task-1") {
+		t.Errorf("keep_open should keep open task-2, drop done task-1: %q", got)
+	}
+}
+
+func TestArchiveWarnsWhenParkingBlocked(t *testing.T) {
+	// The gap from the dogfood session: archive-all files a blocked task off the
+	// board, and that genuinely-unfinished work must be named in the warning (the
+	// closing-list warning excludes blocked, but archive does not — it's leaving
+	// the board with no resume).
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"Audit"}]}`))
+	Update(s, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	Update(s, json.RawMessage(`{"id":"task-2","status":"blocked","evidence":"no scanner available"}`))
+
+	text, isErr := Archive(s, json.RawMessage(`{"label":"phase-2"}`))
+	if isErr {
+		t.Fatalf("archive should not error: %s", text)
+	}
+	if !strings.Contains(text, "parked 1 unfinished task(s)") || !strings.Contains(text, "task-2 blocked") {
+		t.Errorf("archiving a blocked task should warn and name it:\n%s", text)
+	}
+	// And the summary count agrees (1 done, 1 open) — the inconsistency is gone.
+	if !strings.Contains(text, "1 done, 0 cancelled, 1 open") {
+		t.Errorf("summary should count the blocked task as open:\n%s", text)
+	}
+	// keep_open is the suggested alternative: it retains the blocked task on the board.
+	s2 := boundStore(t)
+	Create(s2, json.RawMessage(`{"tasks":[{"title":"A"},{"title":"Audit"}]}`))
+	Update(s2, json.RawMessage(`{"id":"task-1","status":"done"}`))
+	Update(s2, json.RawMessage(`{"id":"task-2","status":"blocked"}`))
+	Archive(s2, json.RawMessage(`{"keep_open":true}`))
+	if got, _ := List(s2, nil); !strings.Contains(got, "task-2  blocked") {
+		t.Errorf("keep_open should retain the blocked task on the board: %q", got)
+	}
+}
+
+func TestArchiveNoOpMessages(t *testing.T) {
+	s := boundStore(t)
+	// Empty board.
+	if text, _ := Archive(s, nil); !strings.Contains(text, "already empty") {
+		t.Errorf("archiving empty board: %s", text)
+	}
+	// Only open tasks + keep_open => nothing terminal to roll off.
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
+	text, _ := Archive(s, json.RawMessage(`{"keep_open":true}`))
+	if !strings.Contains(text, "no done/cancelled tasks") {
+		t.Errorf("keep_open with no terminal tasks should be a no-op note: %s", text)
+	}
+	if got, _ := List(s, nil); !strings.Contains(got, "task-1") {
+		t.Errorf("no-op archive must not drop the open task: %q", got)
+	}
+}
+
+func TestListArchivedAndGeneration(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"Alpha"}]}`))
+	Archive(s, json.RawMessage(`{"label":"first"}`))
+
+	idx, isErr := List(s, json.RawMessage(`{"archived":true}`))
+	if isErr {
+		t.Fatalf("archived list errored: %s", idx)
+	}
+	if !strings.Contains(idx, "gen 1") || !strings.Contains(idx, "first") || !strings.Contains(idx, "1 open") {
+		t.Errorf("archive index should show gen, label, open count:\n%s", idx)
+	}
+
+	one, isErr := List(s, json.RawMessage(`{"generation":1}`))
+	if isErr {
+		t.Fatalf("generation read errored: %s", one)
+	}
+	if !strings.Contains(one, "Archived gen 1") || !strings.Contains(one, "Alpha") {
+		t.Errorf("generation read should show the archived task:\n%s", one)
+	}
+
+	// Unknown generation is a clean error that names what's available.
+	if text, isErr := List(s, json.RawMessage(`{"generation":99}`)); !isErr ||
+		!strings.Contains(text, "no archived generation 99") || !strings.Contains(text, "Available generation(s): 1") {
+		t.Errorf("unknown generation should error and list available ones: %s", text)
+	}
+}
+
+// TestListGenerationZeroFallsThrough replays the session-log footgun: a model
+// padding the call with the JSON zero value (generation:0, archived:false) wants
+// the current list, not a "no archived generation 0" error loop.
+func TestListGenerationZeroFallsThrough(t *testing.T) {
+	s := boundStore(t)
+	Create(s, json.RawMessage(`{"tasks":[{"title":"A"}]}`))
+
+	text, isErr := List(s, json.RawMessage(`{"archived":false,"generation":0}`))
+	if isErr {
+		t.Fatalf("generation:0 must not error: %s", text)
+	}
+	if !strings.Contains(text, "task-1  pending  A") {
+		t.Errorf("generation:0 should return the current list:\n%s", text)
+	}
+	// Negative is treated the same way.
+	if text, isErr := List(s, json.RawMessage(`{"generation":-1}`)); isErr || !strings.Contains(text, "task-1") {
+		t.Errorf("generation:-1 should return current list (err=%v):\n%s", isErr, text)
+	}
+	// generation:0 alongside archived:true still yields the index (0 is ignored).
+	Archive(s, json.RawMessage(`{"label":"first"}`))
+	if text, isErr := List(s, json.RawMessage(`{"archived":true,"generation":0}`)); isErr || !strings.Contains(text, "gen 1") {
+		t.Errorf("archived:true with generation:0 should list the index (err=%v):\n%s", isErr, text)
+	}
+}
+
+// TestListGenerationNotFoundWithNoArchives points the model at the current list
+// when it asks for a generation but none exist yet.
+func TestListGenerationNotFoundWithNoArchives(t *testing.T) {
+	s := boundStore(t)
+	text, isErr := List(s, json.RawMessage(`{"generation":1}`))
+	if !isErr {
+		t.Fatalf("generation lookup with no archives should error: %s", text)
+	}
+	if !strings.Contains(text, "no archived lists yet") || !strings.Contains(text, "no arguments") {
+		t.Errorf("should steer to the no-arg current list:\n%s", text)
 	}
 }

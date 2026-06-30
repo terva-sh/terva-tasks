@@ -30,7 +30,9 @@ build:
 install: build
     #!/usr/bin/env bash
     set -euo pipefail
-    name="terva-tasks"
+    # terva (>= v0.109.1) installs under the manifest NAME ("tasks"), not the
+    # repo basename — so that's the name `ext remove`/`ext list` key on.
+    name="tasks"
     terva ext remove "$name" -y >/dev/null 2>&1 || true
     terva ext install .
     # Install dir is the last column of `ext list`; the path can contain spaces,

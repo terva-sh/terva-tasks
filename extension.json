@@ -1,6 +1,6 @@
 {
   "name": "tasks",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "exec": "./run.sh",
   "language": "go",
   "description": "native-style task list for multi-step work",

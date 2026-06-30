@@ -378,6 +378,151 @@ func TestUpdateBlankTitleIsNoOp(t *testing.T) {
 	}
 }
 
+func TestArchiveAllResetsCurrentAndKeepsIDsMonotonic(t *testing.T) {
+	s := newBound(t)
+	if _, err := s.Create([]CreateSpec{{Title: "A"}, {Title: "B"}, {Title: "C"}}); err != nil {
+		t.Fatal(err)
+	}
+	gen, dropped, ok, err := s.Archive(false, "phase one")
+	if err != nil || !ok {
+		t.Fatalf("archive: ok=%v err=%v", ok, err)
+	}
+	if dropped != 0 {
+		t.Errorf("no cap pressure, want dropped=0 got %d", dropped)
+	}
+	if gen.Seq != 1 || len(gen.Tasks) != 3 || gen.Label != "phase one" {
+		t.Errorf("unexpected generation: %+v", gen)
+	}
+	if n := len(s.List()); n != 0 {
+		t.Errorf("current list should be empty after archive-all, got %d", n)
+	}
+	// IDs are not rewound: the next task continues past the archived ones.
+	created, err := s.Create([]CreateSpec{{Title: "D"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created[0].ID != "task-4" {
+		t.Errorf("nextID must stay monotonic across archive, got %q", created[0].ID)
+	}
+	// A second archive gets the next seq.
+	gen2, _, ok, _ := s.Archive(false, "")
+	if !ok || gen2.Seq != 2 {
+		t.Errorf("second generation seq should be 2, got %+v (ok=%v)", gen2, ok)
+	}
+}
+
+func TestArchiveKeepOpen(t *testing.T) {
+	s := newBound(t)
+	if _, err := s.Create([]CreateSpec{{Title: "open"}, {Title: "fin"}, {Title: "gone"}}); err != nil {
+		t.Fatal(err)
+	}
+	done, cancelled := StatusDone, StatusCancelled
+	if _, _, err := s.Update(UpdatePatch{ID: "task-2", Status: &done}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Update(UpdatePatch{ID: "task-3", Status: &cancelled}); err != nil {
+		t.Fatal(err)
+	}
+	gen, _, ok, err := s.Archive(true, "")
+	if err != nil || !ok {
+		t.Fatalf("archive keep_open: ok=%v err=%v", ok, err)
+	}
+	if len(gen.Tasks) != 2 {
+		t.Errorf("only the two terminal tasks should be archived, got %d", len(gen.Tasks))
+	}
+	cur := s.List()
+	if len(cur) != 1 || cur[0].ID != "task-1" || cur[0].Status != StatusPending {
+		t.Errorf("the open task should remain current: %+v", cur)
+	}
+}
+
+func TestArchiveNoOp(t *testing.T) {
+	s := newBound(t)
+	// Empty list: archive is a no-op, no generation.
+	if _, _, ok, err := s.Archive(false, ""); ok || err != nil {
+		t.Errorf("archiving empty list should be a no-op, got ok=%v err=%v", ok, err)
+	}
+	// keep_open with no terminal tasks: also a no-op, current untouched.
+	if _, err := s.Create([]CreateSpec{{Title: "A"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := s.Archive(true, ""); ok {
+		t.Error("keep_open with no terminal tasks should be a no-op")
+	}
+	if n := len(s.List()); n != 1 {
+		t.Errorf("no-op archive must not mutate current, got %d", n)
+	}
+	if g := s.Generations(); len(g) != 0 {
+		t.Errorf("no generation should be created on a no-op, got %d", len(g))
+	}
+}
+
+func TestArchivePersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s1 := NewStore(NewDirFS(dir), "a")
+	s1.now = fixedClock()
+	if err := s1.Rebind("sess-arch"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Create([]CreateSpec{{Title: "A"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s1.Archive(false, "gen-one"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reload via a fresh store: generations and the gen counter survive.
+	s2 := NewStore(NewDirFS(dir), "a")
+	s2.now = fixedClock()
+	if err := s2.Rebind("sess-arch"); err != nil {
+		t.Fatal(err)
+	}
+	gens := s2.Generations()
+	if len(gens) != 1 || gens[0].Seq != 1 || gens[0].Label != "gen-one" || len(gens[0].Tasks) != 1 {
+		t.Fatalf("generations not persisted/reloaded: %+v", gens)
+	}
+	g, ok := s2.Generation(1)
+	if !ok || g.Tasks[0].Title != "A" {
+		t.Errorf("Generation(1) lookup after reload: %+v ok=%v", g, ok)
+	}
+	// nextGen preserved: the next archive is seq 2, not a reused 1.
+	if _, err := s2.Create([]CreateSpec{{Title: "B"}}); err != nil {
+		t.Fatal(err)
+	}
+	gen2, _, _, _ := s2.Archive(false, "")
+	if gen2.Seq != 2 {
+		t.Errorf("nextGen not preserved across reload, got seq %d", gen2.Seq)
+	}
+}
+
+func TestArchiveGenerationsCap(t *testing.T) {
+	s := newBound(t)
+	// Archive MaxGenerations+2 times; each needs a task to be non-empty.
+	for i := range MaxGenerations + 2 {
+		if _, err := s.Create([]CreateSpec{{Title: "t"}}); err != nil {
+			t.Fatal(err)
+		}
+		_, dropped, ok, err := s.Archive(false, "")
+		if err != nil || !ok {
+			t.Fatalf("archive %d: ok=%v err=%v", i, ok, err)
+		}
+		if i >= MaxGenerations && dropped != 1 {
+			t.Errorf("archive %d past the cap should drop 1 oldest, got %d", i, dropped)
+		}
+	}
+	gens := s.Generations()
+	if len(gens) != MaxGenerations {
+		t.Fatalf("retained generations should be capped at %d, got %d", MaxGenerations, len(gens))
+	}
+	// The oldest seqs were dropped FIFO; the newest is retained.
+	if gens[len(gens)-1].Seq != MaxGenerations+2 {
+		t.Errorf("newest generation seq wrong: %d", gens[len(gens)-1].Seq)
+	}
+	if gens[0].Seq != 3 { // seqs 1 and 2 dropped
+		t.Errorf("oldest retained seq should be 3 after FIFO drop, got %d", gens[0].Seq)
+	}
+}
+
 func TestLoadResilience(t *testing.T) {
 	dir := t.TempDir()
 	// Legacy file: tasks present, no next_id.

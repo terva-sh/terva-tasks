@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	e := ext.New("tasks", "0.2.4")
+	e := ext.New("tasks", "0.3.0")
 	// Require protocol 2: a host that can't deliver session identity or the
 	// context surface (upstream zot, or a pre-v2 terva) refuses to load this
 	// extension with a clear message rather than misbehaving.
@@ -40,6 +40,7 @@ func main() {
 	e.Tool("task_list", descList, schemaList(), a.handleList, ext.ReadOnly())
 	e.Tool("task_create", descCreate, schemaCreate(), a.handleCreate, ext.WithAuthority(ext.AuthorityLocalData))
 	e.Tool("task_update", descUpdate, schemaUpdate(), a.handleUpdate, ext.WithAuthority(ext.AuthorityLocalData))
+	e.Tool("task_archive", descArchive, schemaArchive(), a.handleArchive, ext.WithAuthority(ext.AuthorityLocalData))
 
 	e.OnPanelKey(panelID, a.handleKey, a.handleClose)
 
@@ -82,14 +83,33 @@ const contextPolicy = "You have a task list (task_create / task_update / task_li
 	"- Record short evidence when you complete or block a task (a passing test command, " +
 	"an edited path, a user clarification).\n" +
 	"- Do NOT mark a task 'done' while its tests fail, the work is partial, or errors are " +
-	"unresolved — use 'blocked' and say why."
+	"unresolved — use 'blocked' and say why.\n" +
+	"- PHASES: when a distinct phase is finished (or before starting a new one), run " +
+	"task_archive to roll the old list off and keep the board focused. With NO arguments it " +
+	"archives EVERYTHING and empties the list (that's the default) — pass keep_open:true to " +
+	"archive only finished tasks and keep your open ones. Don't archive open work you mean " +
+	"to keep unless you set keep_open."
 
 // The tool descriptions are deliberately terse — the policy lives in
 // contextPolicy. They keep only the essential rules so the tools remain usable
 // if a user opts out of context injection.
 
-const descList = "Return the current task list (id, status, title). Use it to " +
-	"reorient or to decide what remains before finishing."
+const descList = "Inspect task lists (never mutates). CALL WITH NO ARGUMENTS to get the " +
+	"current list (id, status, title) — that is the usual case; use it to reorient or to " +
+	"decide what remains before finishing. Only when you want to browse archives: pass " +
+	"`archived: true` for the index of archived lists, or `generation: N` to read archived " +
+	"list number N (generations are numbered from 1). Do NOT pass `generation` when you " +
+	"just want the current list — omit it."
+
+const descArchive = "Archive the current task list to start a clean board for the " +
+	"next phase of work. DEFAULT (no arguments): archives EVERYTHING — including open " +
+	"(pending/active/blocked) tasks — and leaves the current list EMPTY. Archived lists " +
+	"stay readable (task_list archived / generation:N) but cannot yet be resumed, so any " +
+	"unfinished task you still intend to do must be recreated afterward. Set `keep_open: " +
+	"true` to archive only finished (done/cancelled) tasks and KEEP your open tasks in the " +
+	"current list — use that to clear completed clutter mid-phase. Optional `label` names " +
+	"the archived list. Archive at the END of a phase or BEFORE starting a new one; if open " +
+	"work should survive, pass keep_open."
 
 const descCreate = "Create tasks for multi-step work. Decompose the job and pass each " +
 	"step as a separate array item in one call — one task per step, not a single " +
@@ -101,10 +121,40 @@ const descCreate = "Create tasks for multi-step work. Decompose the job and pass
 const descUpdate = "Update a task by `id` — mainly status transitions. Mark a task " +
 	"'active' before working it; only one task is active at a time. Provide " +
 	"`evidence` when setting 'done' or 'blocked', and use 'blocked' (not 'done') if " +
-	"the work is failing or incomplete. May also patch `title`, `active_form`, `note`."
+	"the work is failing or incomplete. May also patch `title`, `active_form`, `note`. " +
+	"When you step away from a task (done, cancelled, or blocked) and know which task " +
+	"is next, pass `activate_next` with its id — that closes/parks this one and focuses " +
+	"the next in a single step (valid only with status 'done', 'cancelled', or 'blocked')."
 
 func schemaList() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{}}`)
+	// No `minimum` on generation on purpose: a schema-validating host could reject
+	// generation:0 before the handler runs, defeating the graceful fall-through
+	// that turns a padded generation:0 into "return the current list".
+	b, _ := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"archived": map[string]any{
+				"type":        "boolean",
+				"description": "List the archived generations instead of the current list.",
+			},
+			"generation": map[string]any{
+				"type":        "integer",
+				"description": "Read one archived list by its number (numbered from 1). Omit to get the current list.",
+			},
+		},
+	})
+	return b
+}
+
+func schemaArchive() json.RawMessage {
+	b, _ := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"keep_open": map[string]any{"type": "boolean"},
+			"label":     map[string]any{"type": "string"},
+		},
+	})
+	return b
 }
 
 func schemaCreate() json.RawMessage {
@@ -140,6 +190,10 @@ func schemaUpdate() json.RawMessage {
 			"status":      map[string]any{"type": "string", "enum": statusEnum},
 			"evidence":    map[string]any{"type": "string"},
 			"note":        map[string]any{"type": "string"},
+			"activate_next": map[string]any{
+				"type":        "string",
+				"description": "When you step away from this task (status \"done\", \"cancelled\", or \"blocked\"), the id of the next task to focus, activated in the same step. Closes/parks this task and activates that one. Omit if there is no obvious next task.",
+			},
 		},
 		"required": []string{"id"},
 	})

@@ -19,6 +19,56 @@ func RenderCompact(tasks []Task) string {
 	return strings.Join(lines, "\n")
 }
 
+// RenderArchiveIndex renders the list of archived generations for
+// task_list {archived:true}: one line each with seq, date, task count, how many
+// are still open (non-terminal, matching the panel's notion of "open"), and an
+// optional label. Newest last, as stored. Empty => a friendly note.
+func RenderArchiveIndex(gens []Generation) string {
+	if len(gens) == 0 {
+		return "No archived task lists."
+	}
+	lines := make([]string, 0, len(gens))
+	for _, g := range gens {
+		open := 0
+		for _, t := range g.Tasks {
+			if !t.Status.IsTerminal() {
+				open++
+			}
+		}
+		line := fmt.Sprintf("gen %d  %s  %d task(s)", g.Seq, archiveDate(g.ArchivedAt), len(g.Tasks))
+		if open > 0 {
+			line += fmt.Sprintf(", %d open", open)
+		}
+		if lbl := CleanOneLine(g.Label, MaxLabelLen); lbl != "" {
+			line += " — " + lbl
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// RenderGeneration renders one archived generation's tasks (read-only) for
+// task_list {generation:N}, reusing the compact line format.
+func RenderGeneration(g Generation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Archived gen %d (%s)", g.Seq, archiveDate(g.ArchivedAt))
+	if lbl := CleanOneLine(g.Label, MaxLabelLen); lbl != "" {
+		fmt.Fprintf(&b, " — %s", lbl)
+	}
+	b.WriteByte('\n')
+	b.WriteString(RenderCompact(g.Tasks))
+	return b.String()
+}
+
+// archiveDate shows the YYYY-MM-DD prefix of an RFC3339 timestamp, falling back
+// to the whole string if it's shorter/unexpected.
+func archiveDate(ts string) string {
+	if len(ts) >= 10 {
+		return ts[:10]
+	}
+	return ts
+}
+
 func compactLine(t Task) string {
 	line := fmt.Sprintf("%s  %-8s %s", t.ID, t.Status, displayLabel(t))
 	if ev := strings.TrimSpace(t.Evidence); ev != "" {
@@ -247,6 +297,26 @@ func OpenSummary(tasks []Task) (open, active int, names []string) {
 		}
 	}
 	return open, active, names
+}
+
+// UnfinishedSummary classifies a list for the archive warning: it counts every
+// non-terminal task (pending, active, OR blocked) and returns a short bounded
+// slice of "id status" labels. Unlike OpenSummary — which powers the
+// closing-the-list warning and excludes blocked as an acknowledged park —
+// archiving removes a task from the board entirely, and with no resume yet a
+// filed-away blocked task is exactly the unfinished work most likely to be lost,
+// so it counts here.
+func UnfinishedSummary(tasks []Task) (count int, names []string) {
+	for _, t := range tasks {
+		if t.Status.IsTerminal() {
+			continue
+		}
+		count++
+		if len(names) < openSummaryMaxNames {
+			names = append(names, t.ID+" "+string(t.Status))
+		}
+	}
+	return count, names
 }
 
 // StatusGlance is the short TUI status-line segment (not model-facing): the

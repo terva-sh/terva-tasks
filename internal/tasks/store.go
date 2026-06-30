@@ -72,10 +72,24 @@ type UpdatePatch struct {
 	Note       *string
 }
 
-// storeFile is the on-disk shape.
+// Generation is an archived snapshot of a task list, parked when the agent rolls
+// the board over to a new phase of work. It is read-only history: tasks keep the
+// ids and statuses they had at archive time, so a generation can be browsed
+// (task_list) and, in a later tier, resumed.
+type Generation struct {
+	Seq        int    `json:"seq"`         // monotonic per session, never reused
+	ArchivedAt string `json:"archived_at"` // RFC3339
+	Label      string `json:"label,omitempty"`
+	Tasks      []Task `json:"tasks"`
+}
+
+// storeFile is the on-disk shape. Generations/NextGen are omitempty so files
+// written before archiving existed parse unchanged (absent => no history).
 type storeFile struct {
-	Tasks  []Task `json:"tasks"`
-	NextID int    `json:"next_id"`
+	Tasks       []Task       `json:"tasks"`
+	NextID      int          `json:"next_id"`
+	Generations []Generation `json:"generations,omitempty"`
+	NextGen     int          `json:"next_gen,omitempty"`
 }
 
 // Store is the session-scoped task list. The zero session id ("") means "no
@@ -91,6 +105,9 @@ type Store struct {
 	now       func() time.Time
 	tasks     []Task
 	nextID    int
+
+	generations []Generation
+	nextGen     int
 }
 
 // NewStore constructs an in-memory store. fs may be nil at construction (it
@@ -101,10 +118,11 @@ func NewStore(fs FileStore, owner string) *Store {
 		owner = "agent"
 	}
 	return &Store{
-		fs:     fs,
-		owner:  owner,
-		now:    time.Now,
-		nextID: 1,
+		fs:      fs,
+		owner:   owner,
+		now:     time.Now,
+		nextID:  1,
+		nextGen: 1,
 	}
 }
 
@@ -150,6 +168,8 @@ func (s *Store) Rebind(sessionID string) error {
 	carry := s.sessionID == "" && sessionID != ""
 	prevTasks := s.tasks
 	prevNextID := s.nextID
+	prevGens := s.generations
+	prevNextGen := s.nextGen
 
 	if s.canPersistLocked() {
 		_ = s.saveLocked() // best-effort flush of the outgoing session
@@ -162,6 +182,8 @@ func (s *Store) Rebind(sessionID string) error {
 	// session showing the previous session's tasks.
 	var newTasks []Task
 	newNextID := 1
+	var newGens []Generation
+	newNextGen := 1
 	var warn error
 	didCarry := false
 
@@ -181,11 +203,19 @@ func (s *Store) Rebind(sessionID string) error {
 			if newNextID < 1 {
 				newNextID = deriveNextID(newTasks)
 			}
+			newGens = sf.Generations
+			newNextGen = sf.NextGen
+			if newNextGen < 1 {
+				newNextGen = deriveNextGen(newGens)
+			}
 		case carry && len(prevTasks) > 0:
 			// First binding out of pre-session in-memory state: carry that work
-			// into the new (empty) session file.
+			// (and any generations archived before the session opened) into the
+			// new (empty) session file.
 			newTasks = prevTasks
 			newNextID = prevNextID
+			newGens = prevGens
+			newNextGen = prevNextGen
 			didCarry = true
 		}
 	}
@@ -195,6 +225,8 @@ func (s *Store) Rebind(sessionID string) error {
 	s.name = newName
 	s.tasks = newTasks
 	s.nextID = newNextID
+	s.generations = newGens
+	s.nextGen = newNextGen
 
 	// Persist only genuinely carried pre-bind work immediately. A loaded board is
 	// left where it is (migrating lazily on its first mutation via the FileStore's
@@ -259,11 +291,29 @@ func deriveNextID(tasks []Task) int {
 	return max + 1
 }
 
+// deriveNextGen recovers the generation counter from existing archives when a
+// file predates next_gen (e.g. a board archived by an older build, or a
+// hand-edited file).
+func deriveNextGen(gens []Generation) int {
+	max := 0
+	for _, g := range gens {
+		if g.Seq > max {
+			max = g.Seq
+		}
+	}
+	return max + 1
+}
+
 func (s *Store) saveLocked() error {
 	if !s.canPersistLocked() {
 		return nil // in-memory only
 	}
-	b, err := json.MarshalIndent(storeFile{Tasks: s.tasks, NextID: s.nextID}, "", "  ")
+	b, err := json.MarshalIndent(storeFile{
+		Tasks:       s.tasks,
+		NextID:      s.nextID,
+		Generations: s.generations,
+		NextGen:     s.nextGen,
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -430,4 +480,77 @@ func (s *Store) List() []Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Task(nil), s.tasks...)
+}
+
+// Archive parks the current list as a new read-only generation and clears it for
+// the next phase of work.
+//
+//   - Default (keepOpen == false): archive EVERYTHING, including open tasks, and
+//     leave the current list empty. This is the phase-boundary mode.
+//   - keepOpen == true: archive only terminal tasks (done/cancelled); the open
+//     (pending/active/blocked) tasks stay in the current list. The "drop the
+//     completed clutter mid-phase" mode.
+//
+// IDs stay monotonic across generations (nextID is never rewound), so archived
+// ids never collide with future ones — which also keeps a future resume clean.
+// It returns the created generation, how many oldest generations were dropped to
+// honor MaxGenerations, and ok == false (no generation, no write) when there is
+// nothing to archive (an empty list, or keepOpen with no terminal tasks).
+func (s *Store) Archive(keepOpen bool, label string) (gen Generation, dropped int, ok bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var archived, remaining []Task
+	if keepOpen {
+		for _, t := range s.tasks {
+			if t.Status.IsTerminal() {
+				archived = append(archived, t)
+			} else {
+				remaining = append(remaining, t)
+			}
+		}
+	} else {
+		archived = s.tasks
+	}
+	if len(archived) == 0 {
+		return Generation{}, 0, false, nil // nothing to archive: no-op
+	}
+
+	gen = Generation{
+		Seq:        s.nextGen,
+		ArchivedAt: s.nowStr(),
+		Label:      CleanOneLine(label, MaxLabelLen),
+		Tasks:      archived,
+	}
+	s.nextGen++
+	s.generations = append(s.generations, gen)
+	if over := len(s.generations) - MaxGenerations; over > 0 {
+		dropped = over
+		s.generations = append([]Generation(nil), s.generations[over:]...)
+	}
+	s.tasks = remaining
+
+	if err := s.saveLocked(); err != nil {
+		return Generation{}, 0, false, err
+	}
+	return gen, dropped, true, nil
+}
+
+// Generations returns a copy of the archived generations (oldest first).
+func (s *Store) Generations() []Generation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Generation(nil), s.generations...)
+}
+
+// Generation returns the archived generation with the given seq, if present.
+func (s *Store) Generation(seq int) (Generation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.generations {
+		if g.Seq == seq {
+			return g, true
+		}
+	}
+	return Generation{}, false
 }

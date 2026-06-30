@@ -169,6 +169,73 @@ func TestOpenSummary(t *testing.T) {
 	}
 }
 
+func TestRenderArchiveIndex(t *testing.T) {
+	if got := RenderArchiveIndex(nil); got != "No archived task lists." {
+		t.Errorf("empty index: %q", got)
+	}
+	gens := []Generation{
+		{Seq: 1, ArchivedAt: "2026-06-29T12:00:00Z", Label: "phase one", Tasks: []Task{
+			{ID: "task-1", Status: StatusDone}, {ID: "task-2", Status: StatusPending},
+		}},
+		{Seq: 2, ArchivedAt: "2026-06-30T09:30:00Z", Tasks: []Task{
+			{ID: "task-3", Status: StatusDone},
+		}},
+	}
+	out := RenderArchiveIndex(gens)
+	if !strings.Contains(out, "gen 1  2026-06-29  2 task(s), 1 open — phase one") {
+		t.Errorf("gen 1 line wrong:\n%s", out)
+	}
+	// gen 2 is all-terminal: no open count, no label dash.
+	if !strings.Contains(out, "gen 2  2026-06-30  1 task(s)") || strings.Contains(out, "gen 2  2026-06-30  1 task(s), ") {
+		t.Errorf("gen 2 line wrong:\n%s", out)
+	}
+}
+
+func TestRenderGeneration(t *testing.T) {
+	g := Generation{Seq: 3, ArchivedAt: "2026-06-29T12:00:00Z", Label: "auth refactor", Tasks: []Task{
+		{ID: "task-7", Title: "Add CSV serializer", Status: StatusDone, Evidence: "go test ./... passed"},
+	}}
+	out := RenderGeneration(g)
+	if !strings.Contains(out, "Archived gen 3 (2026-06-29) — auth refactor") {
+		t.Errorf("generation header wrong:\n%s", out)
+	}
+	if !strings.Contains(out, "task-7  done     Add CSV serializer — go test ./... passed") {
+		t.Errorf("generation body should reuse compact rows:\n%s", out)
+	}
+}
+
+func TestUnfinishedSummary(t *testing.T) {
+	// Non-terminal = pending + active + BLOCKED (unlike OpenSummary, which excludes
+	// blocked); done/cancelled are excluded.
+	tasks := []Task{
+		{ID: "task-1", Status: StatusActive},
+		{ID: "task-2", Status: StatusPending},
+		{ID: "task-3", Status: StatusBlocked},
+		{ID: "task-4", Status: StatusDone},
+		{ID: "task-5", Status: StatusCancelled},
+	}
+	count, names := UnfinishedSummary(tasks)
+	if count != 3 {
+		t.Fatalf("want 3 unfinished (incl. blocked), got %d", count)
+	}
+	if len(names) != 3 || names[2] != "task-3 blocked" {
+		t.Errorf("blocked task should be named as unfinished: %v", names)
+	}
+
+	// names are bounded; the count still reflects the full total.
+	var many []Task
+	for range openSummaryMaxNames + 2 {
+		many = append(many, Task{ID: "task-x", Status: StatusBlocked})
+	}
+	count, names = UnfinishedSummary(many)
+	if count != openSummaryMaxNames+2 {
+		t.Errorf("count should be the full total, got %d", count)
+	}
+	if len(names) != openSummaryMaxNames {
+		t.Errorf("names should cap at %d, got %d", openSummaryMaxNames, len(names))
+	}
+}
+
 func TestStatusGlance(t *testing.T) {
 	if StatusGlance(nil) != "" {
 		t.Error("empty list => empty glance")

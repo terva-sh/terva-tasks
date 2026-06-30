@@ -15,8 +15,13 @@ const (
 	MaxNoteLen         = 300
 	MaxEvidenceLen     = 500
 	MaxSessionTitle    = 80
+	MaxLabelLen        = 80
 	MaxBatch           = 100
 	MaxTasksPerSession = 500
+	// MaxGenerations bounds how many archived task lists a session file retains.
+	// The file is loaded whole on every session open, so archives can't grow
+	// without limit; the oldest generations are dropped FIFO past this cap.
+	MaxGenerations = 50
 )
 
 // CleanOneLine collapses a value to a single safe display line: newlines, tabs,
